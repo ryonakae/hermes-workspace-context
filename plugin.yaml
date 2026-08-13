@@ -1,0 +1,8 @@
+name: hermes-workspace-context
+version: "0.1.0"
+description: Apply project workspace contexts to selected gateway conversations.
+author: Ryo Nakae
+hooks:
+  - pre_gateway_dispatch
+provides_hooks:
+  - pre_gateway_dispatch

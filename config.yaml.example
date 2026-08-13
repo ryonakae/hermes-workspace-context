@@ -1,0 +1,10 @@
+workspaces:
+  example-app:
+    cwd: /absolute/path/to/example-app
+    skill_dirs:
+      - .agents/skills
+
+routes:
+  - platform: slack
+    chat_id: C0123456789
+    workspace: example-app
