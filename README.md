@@ -4,7 +4,7 @@ Apply a project workspace context to selected Hermes gateway conversations witho
 
 ## Features
 
-- **Session-local cwd:** Pins Hermes' logical working directory for matching gateway sessions without calling `os.chdir()`.
+- **Session-local cwd:** Pins Hermes' prompt/context cwd and terminal/file task cwd for matching gateway sessions without calling `os.chdir()`.
 - **Workspace context:** Applies the workspace's cwd, context files, skills, and MCP tools to each matching conversation.
 - **Project-first skills:** Adds configured project skill directories to the standard skills index. A project skill wins when its name matches a global skill.
 - **Workspace MCP:** Auto-detects Claude Code, Codex, OpenCode, and Hermes project MCP configs, merges compatible entries, and exposes their namespaced tools only while that workspace route is active.
@@ -130,7 +130,7 @@ A route must include `chat_id`, `thread_id`, or both.
 
 ## Safety boundaries
 
-The plugin does not change the process cwd. It uses Hermes' session-scoped cwd `ContextVar`, then restores the previous token after the turn. The workspace marker is another task-local `ContextVar`, so concurrent routed and unrouted turns do not share state.
+The plugin does not change the process cwd. It binds both Hermes' session-scoped cwd `ContextVar` and the terminal/file task cwd for the gateway session ID, then restores their previous values after the turn. The workspace marker is another task-local `ContextVar`, so concurrent routed and unrouted turns do not share state.
 
 MCP servers live in Hermes' process-wide MCP registry because Hermes manages MCP connections globally. The plugin namespaces server names as `workspace-<workspace>-<server>` and adds their toolsets only to matching turns. Unmatched turns cannot discover those tools through their enabled toolset catalog.
 
@@ -142,6 +142,7 @@ This plugin intentionally uses Hermes private APIs because the public plugin API
 
 - gateway instance methods `_set_session_env()` and `_clear_session_env()`;
 - `agent.runtime_cwd.set_session_cwd()` returning a `ContextVar` token;
+- task cwd helpers and registries in `tools.terminal_tool`;
 - skill discovery helpers in `agent.skill_utils`, `agent.prompt_builder`, and `tools.skills_tool`;
 - `hermes_cli.tools_config._get_platform_tools()`;
 - `tools.mcp_tool.register_mcp_servers()`.

@@ -23,7 +23,7 @@ PYTHONPATH=.:$HOME/.hermes/hermes-agent PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python 
 - `__init__.py`: standalone Hermes plugin entry point.
 - `plugin.yaml`: plugin manifest and hook declaration.
 - `workspace_context/config.py`: local YAML validation and path resolution.
-- `workspace_context/runtime.py`: gateway route matching and cwd ContextVar lifecycle.
+- `workspace_context/runtime.py`: gateway route matching and prompt/tool cwd lifecycle.
 - `workspace_context/skills.py`: read-only project skill overlays.
 - `workspace_context/mcp.py`: Claude/Codex/OpenCode/Hermes MCP discovery, conversion, merging, namespacing, registration, and toolset scoping.
 - `workspace_context/plugin.py`: startup orchestration.
@@ -50,7 +50,7 @@ Before committing:
 1. Run the focused test for the changed subsystem.
 2. Run the complete test suite with the active Hermes checkout on `PYTHONPATH`.
 3. Run `py_compile` and `git diff --check`.
-4. For private API changes, perform an active-Hermes smoke test that proves routed and unrouted catalogs differ.
+4. For private API changes, perform an active-Hermes smoke test that proves routed prompt, terminal, and file cwd agree while unrouted state remains unchanged.
 5. Confirm `config.yaml`, credentials, channel IDs, workspace paths, and `.mcp.json` contents are not staged.
 
 ## Runtime changes

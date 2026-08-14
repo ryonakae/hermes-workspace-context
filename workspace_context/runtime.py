@@ -25,7 +25,15 @@ class RoutedSessionTokens:
     hermes_tokens: Any
     workspace_token: Token[Workspace | None]
     cwd_token: Any | None
+    tool_cwd_token: Any | None
     routed: bool
+
+
+@dataclass(frozen=True)
+class ToolCwdToken:
+    task_id: str
+    previous_overrides: dict[str, Any] | None
+    previous_cwd: str | None
 
 
 def current_workspace() -> Workspace | None:
@@ -66,12 +74,44 @@ def _default_reset_session_cwd(token: Any) -> None:
     token.var.reset(token)
 
 
+def _default_bind_tool_cwd(task_id: str, cwd: str) -> ToolCwdToken:
+    from tools import terminal_tool
+
+    previous_overrides = terminal_tool._task_env_overrides.get(task_id)
+    previous_cwd = terminal_tool.get_session_cwd(task_id)
+    routed_overrides = dict(previous_overrides or {})
+    routed_overrides["cwd"] = cwd
+    terminal_tool.register_task_env_overrides(task_id, routed_overrides)
+    return ToolCwdToken(
+        task_id=task_id,
+        previous_overrides=(
+            dict(previous_overrides) if previous_overrides is not None else None
+        ),
+        previous_cwd=previous_cwd,
+    )
+
+
+def _default_reset_tool_cwd(token: ToolCwdToken) -> None:
+    from tools import terminal_tool
+
+    terminal_tool.clear_task_env_overrides(token.task_id)
+    if token.previous_overrides is not None:
+        terminal_tool.register_task_env_overrides(
+            token.task_id,
+            token.previous_overrides,
+        )
+    if token.previous_cwd is not None:
+        terminal_tool.record_session_cwd(token.task_id, token.previous_cwd)
+
+
 def install_gateway_patches(
     gateway: Any,
     config: RouterConfig,
     *,
     set_session_cwd: Callable[[str], Any] | None = None,
     reset_session_cwd: Callable[[Any], None] | None = None,
+    bind_tool_cwd: Callable[[str, str], Any] | None = None,
+    reset_tool_cwd: Callable[[Any], None] | None = None,
 ) -> None:
     """Wrap one gateway instance's session scope without changing process cwd."""
     if getattr(gateway, _PATCH_MARKER, False):
@@ -86,28 +126,46 @@ def install_gateway_patches(
 
     bind_cwd = set_session_cwd or _default_set_session_cwd
     reset_cwd = reset_session_cwd or _default_reset_session_cwd
+    bind_tools = bind_tool_cwd or _default_bind_tool_cwd
+    reset_tools = reset_tool_cwd or _default_reset_tool_cwd
 
     def routed_set(context: Any) -> RoutedSessionTokens:
         workspace = workspace_for_source(config, context.source)
         workspace_token = _CURRENT_WORKSPACE.set(workspace)
         hermes_tokens = None
         cwd_token = None
+        tool_cwd_token = None
         try:
             hermes_tokens = original_set(context)
             if workspace is not None:
                 cwd_token = bind_cwd(str(workspace.cwd))
+                session_id = str(getattr(context, "session_id", "") or "")
+                if not session_id:
+                    raise CompatibilityError(
+                        "Hermes gateway session context is missing session_id"
+                    )
+                tool_cwd_token = bind_tools(session_id, str(workspace.cwd))
             return RoutedSessionTokens(
                 hermes_tokens=hermes_tokens,
                 workspace_token=workspace_token,
                 cwd_token=cwd_token,
+                tool_cwd_token=tool_cwd_token,
                 routed=workspace is not None,
             )
         except BaseException:
             try:
-                if hermes_tokens is not None:
-                    original_clear(hermes_tokens)
+                if tool_cwd_token is not None:
+                    reset_tools(tool_cwd_token)
             finally:
-                _CURRENT_WORKSPACE.reset(workspace_token)
+                try:
+                    if cwd_token is not None:
+                        reset_cwd(cwd_token)
+                finally:
+                    try:
+                        if hermes_tokens is not None:
+                            original_clear(hermes_tokens)
+                    finally:
+                        _CURRENT_WORKSPACE.reset(workspace_token)
             raise
 
     def routed_clear(tokens: Any) -> None:
@@ -118,10 +176,14 @@ def install_gateway_patches(
             original_clear(tokens.hermes_tokens)
         finally:
             try:
-                if tokens.cwd_token is not None:
-                    reset_cwd(tokens.cwd_token)
+                if tokens.tool_cwd_token is not None:
+                    reset_tools(tokens.tool_cwd_token)
             finally:
-                _CURRENT_WORKSPACE.reset(tokens.workspace_token)
+                try:
+                    if tokens.cwd_token is not None:
+                        reset_cwd(tokens.cwd_token)
+                finally:
+                    _CURRENT_WORKSPACE.reset(tokens.workspace_token)
 
     gateway._set_session_env = routed_set
     gateway._clear_session_env = routed_clear
