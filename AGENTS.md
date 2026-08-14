@@ -35,7 +35,7 @@ PYTHONPATH=.:$HOME/.hermes/hermes-agent PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python 
 - Add a failing test before changing routing, cwd restoration, skill precedence, or MCP visibility.
 - Keep Hermes private API access inside `runtime.py`, `skills.py`, and `mcp.py`.
 - Never call `os.chdir()`. Gateway turns may run concurrently.
-- Store per-turn state in `ContextVar`; restore tokens in `finally` blocks.
+- Store per-turn prompt state in `ContextVar`; keep shared tool-cwd state ownership-tracked and restore it in `finally` blocks without mutating a shared live environment cwd.
 - Namespace MCP server names before inserting them into Hermes' global registry.
 - Skip only the conflicting server when project MCP files reuse a name for different connection targets. Never log URLs, headers, environment values, or OAuth credentials in conflict warnings.
 - Do not add workspace MCP toolsets to unrouted turns.

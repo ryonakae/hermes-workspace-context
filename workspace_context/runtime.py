@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+import threading
 from typing import Any, Callable
 
 from .config import Route, RouterConfig, Workspace
@@ -32,8 +33,32 @@ class RoutedSessionTokens:
 @dataclass(frozen=True)
 class ToolCwdToken:
     task_id: str
+    binding_id: object
+    cwd: str
+
+
+_NO_ENVIRONMENT_CWD_UPDATE = object()
+_MISSING_ENVIRONMENT_CWD = object()
+
+
+@dataclass
+class _ToolCwdState:
     previous_overrides: dict[str, Any] | None
     previous_cwd: str | None
+    previous_environment: Any | None
+    previous_environment_cwd: Any
+    plugin_owned_isolation: bool
+    bindings: list[ToolCwdToken]
+
+
+_TOOL_CWD_LOCK = threading.RLock()
+_TOOL_CWD_CONDITION = threading.Condition(_TOOL_CWD_LOCK)
+_TOOL_CWD_STATES: dict[str, _ToolCwdState] = {}
+_PLUGIN_ISOLATED_SESSION_IDS: set[str] = set()
+_CLEANING_ISOLATED_SESSION_IDS: set[str] = set()
+_ISOLATION_KEYS = frozenset(
+    {"docker_image", "modal_image", "singularity_image", "daytona_image", "env_type"}
+)
 
 
 def current_workspace() -> Workspace | None:
@@ -74,34 +99,224 @@ def _default_reset_session_cwd(token: Any) -> None:
     token.var.reset(token)
 
 
+def _restore_session_cwd_direct(terminal_tool: Any, task_id: str, cwd: str | None) -> None:
+    with terminal_tool._session_cwd_lock:
+        if cwd is None:
+            terminal_tool._session_cwd.pop(task_id, None)
+        else:
+            terminal_tool._session_cwd[task_id] = cwd
+
+
+def _set_environment_cwd_if_current(
+    terminal_tool: Any,
+    task_id: str,
+    environment: Any,
+    cwd: Any,
+) -> None:
+    with terminal_tool._env_lock:
+        if terminal_tool._active_environments.get(task_id) is environment:
+            if cwd is _MISSING_ENVIRONMENT_CWD:
+                if hasattr(environment, "cwd"):
+                    delattr(environment, "cwd")
+            else:
+                environment.cwd = cwd
+
+
+def _replace_tool_task_state(
+    terminal_tool: Any,
+    task_id: str,
+    overrides: dict[str, Any] | None,
+    cwd: str | None,
+    *,
+    update_isolated_environment: bool,
+    environment_cwd: Any = _NO_ENVIRONMENT_CWD_UPDATE,
+    expected_environment: Any | None = None,
+) -> None:
+    previous_overrides = terminal_tool._task_env_overrides.get(task_id)
+    previous_cwd = terminal_tool.get_session_cwd(task_id)
+    with terminal_tool._env_lock:
+        environment = terminal_tool._active_environments.get(task_id)
+        previous_environment_cwd = (
+            getattr(environment, "cwd", _MISSING_ENVIRONMENT_CWD)
+            if environment is not None
+            else _NO_ENVIRONMENT_CWD_UPDATE
+        )
+    try:
+        if overrides is None:
+            terminal_tool._task_env_overrides.pop(task_id, None)
+        else:
+            terminal_tool._task_env_overrides[task_id] = dict(overrides)
+        if cwd is None:
+            terminal_tool.clear_session_cwd(task_id)
+        else:
+            terminal_tool.record_session_cwd(task_id, cwd)
+        if (
+            update_isolated_environment
+            and environment is not None
+            and environment_cwd is not _NO_ENVIRONMENT_CWD_UPDATE
+            and (expected_environment is None or environment is expected_environment)
+        ):
+            _set_environment_cwd_if_current(
+                terminal_tool,
+                task_id,
+                environment,
+                environment_cwd,
+            )
+    except BaseException:
+        if previous_overrides is None:
+            terminal_tool._task_env_overrides.pop(task_id, None)
+        else:
+            terminal_tool._task_env_overrides[task_id] = previous_overrides
+        _restore_session_cwd_direct(terminal_tool, task_id, previous_cwd)
+        if environment is not None:
+            try:
+                _set_environment_cwd_if_current(
+                    terminal_tool,
+                    task_id,
+                    environment,
+                    previous_environment_cwd,
+                )
+            except BaseException:
+                pass
+        raise
+
+
+def _requests_isolation(overrides: dict[str, Any] | None) -> bool:
+    return bool(overrides and _ISOLATION_KEYS.intersection(overrides))
+
+
+def _routed_overrides(
+    terminal_tool: Any,
+    state: _ToolCwdState,
+    cwd: str,
+) -> dict[str, Any]:
+    overrides = dict(state.previous_overrides or {})
+    overrides["cwd"] = cwd
+    if not _requests_isolation(overrides):
+        overrides["env_type"] = terminal_tool._get_env_config()["env_type"]
+    return overrides
+
+
 def _default_bind_tool_cwd(task_id: str, cwd: str) -> ToolCwdToken:
     from tools import terminal_tool
 
-    previous_overrides = terminal_tool._task_env_overrides.get(task_id)
-    previous_cwd = terminal_tool.get_session_cwd(task_id)
-    routed_overrides = dict(previous_overrides or {})
-    routed_overrides["cwd"] = cwd
-    terminal_tool.register_task_env_overrides(task_id, routed_overrides)
-    return ToolCwdToken(
-        task_id=task_id,
-        previous_overrides=(
-            dict(previous_overrides) if previous_overrides is not None else None
-        ),
-        previous_cwd=previous_cwd,
-    )
+    with _TOOL_CWD_CONDITION:
+        while task_id in _CLEANING_ISOLATED_SESSION_IDS:
+            _TOOL_CWD_CONDITION.wait()
+        state = _TOOL_CWD_STATES.get(task_id)
+        if state is None:
+            previous_overrides = terminal_tool._task_env_overrides.get(task_id)
+            with terminal_tool._env_lock:
+                previous_environment = terminal_tool._active_environments.get(task_id)
+                previous_environment_cwd = (
+                    getattr(
+                        previous_environment,
+                        "cwd",
+                        _MISSING_ENVIRONMENT_CWD,
+                    )
+                    if previous_environment is not None
+                    else _NO_ENVIRONMENT_CWD_UPDATE
+                )
+            plugin_owned_isolation = task_id in _PLUGIN_ISOLATED_SESSION_IDS or (
+                not _requests_isolation(previous_overrides)
+                and previous_environment is None
+            )
+            state = _ToolCwdState(
+                previous_overrides=(
+                    dict(previous_overrides)
+                    if previous_overrides is not None
+                    else None
+                ),
+                previous_cwd=terminal_tool.get_session_cwd(task_id),
+                previous_environment=previous_environment,
+                previous_environment_cwd=previous_environment_cwd,
+                plugin_owned_isolation=plugin_owned_isolation,
+                bindings=[],
+            )
+        token = ToolCwdToken(task_id=task_id, binding_id=object(), cwd=cwd)
+        _replace_tool_task_state(
+            terminal_tool,
+            task_id,
+            _routed_overrides(terminal_tool, state, cwd),
+            cwd,
+            update_isolated_environment=True,
+            environment_cwd=cwd,
+        )
+        state.bindings.append(token)
+        _TOOL_CWD_STATES[task_id] = state
+        if state.plugin_owned_isolation:
+            _PLUGIN_ISOLATED_SESSION_IDS.add(task_id)
+        return token
 
 
 def _default_reset_tool_cwd(token: ToolCwdToken) -> None:
     from tools import terminal_tool
 
-    terminal_tool.clear_task_env_overrides(token.task_id)
-    if token.previous_overrides is not None:
-        terminal_tool.register_task_env_overrides(
-            token.task_id,
-            token.previous_overrides,
-        )
-    if token.previous_cwd is not None:
-        terminal_tool.record_session_cwd(token.task_id, token.previous_cwd)
+    with _TOOL_CWD_LOCK:
+        state = _TOOL_CWD_STATES.get(token.task_id)
+        if state is None:
+            return
+        try:
+            index = next(
+                index
+                for index, binding in enumerate(state.bindings)
+                if binding.binding_id is token.binding_id
+            )
+        except StopIteration:
+            return
+
+        state.bindings.pop(index)
+        try:
+            if state.bindings:
+                active_cwd = state.bindings[-1].cwd
+                _replace_tool_task_state(
+                    terminal_tool,
+                    token.task_id,
+                    _routed_overrides(terminal_tool, state, active_cwd),
+                    active_cwd,
+                    update_isolated_environment=True,
+                    environment_cwd=active_cwd,
+                )
+            else:
+                _replace_tool_task_state(
+                    terminal_tool,
+                    token.task_id,
+                    state.previous_overrides,
+                    state.previous_cwd,
+                    update_isolated_environment=(
+                        not state.plugin_owned_isolation
+                        and state.previous_environment is not None
+                    ),
+                    environment_cwd=state.previous_environment_cwd,
+                    expected_environment=state.previous_environment,
+                )
+                _TOOL_CWD_STATES.pop(token.task_id, None)
+        except BaseException:
+            state.bindings.insert(index, token)
+            raise
+
+
+def _cleanup_plugin_isolation_for_unrouted_session(task_id: str) -> None:
+    from tools import terminal_tool
+
+    with _TOOL_CWD_CONDITION:
+        if task_id not in _PLUGIN_ISOLATED_SESSION_IDS:
+            return
+        if task_id in _TOOL_CWD_STATES:
+            return
+        if task_id in _CLEANING_ISOLATED_SESSION_IDS:
+            return
+        if _requests_isolation(terminal_tool._task_env_overrides.get(task_id)):
+            _PLUGIN_ISOLATED_SESSION_IDS.discard(task_id)
+            return
+        _CLEANING_ISOLATED_SESSION_IDS.add(task_id)
+    try:
+        terminal_tool.cleanup_vm(task_id)
+    finally:
+        with _TOOL_CWD_CONDITION:
+            _PLUGIN_ISOLATED_SESSION_IDS.discard(task_id)
+            _CLEANING_ISOLATED_SESSION_IDS.discard(task_id)
+            _TOOL_CWD_CONDITION.notify_all()
 
 
 def install_gateway_patches(
@@ -137,14 +352,16 @@ def install_gateway_patches(
         tool_cwd_token = None
         try:
             hermes_tokens = original_set(context)
+            session_id = str(getattr(context, "session_id", "") or "")
             if workspace is not None:
                 cwd_token = bind_cwd(str(workspace.cwd))
-                session_id = str(getattr(context, "session_id", "") or "")
                 if not session_id:
                     raise CompatibilityError(
                         "Hermes gateway session context is missing session_id"
                     )
                 tool_cwd_token = bind_tools(session_id, str(workspace.cwd))
+            elif session_id:
+                _cleanup_plugin_isolation_for_unrouted_session(session_id)
             return RoutedSessionTokens(
                 hermes_tokens=hermes_tokens,
                 workspace_token=workspace_token,

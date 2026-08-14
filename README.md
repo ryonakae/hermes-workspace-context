@@ -130,7 +130,7 @@ A route must include `chat_id`, `thread_id`, or both.
 
 ## Safety boundaries
 
-The plugin does not change the process cwd. It binds both Hermes' session-scoped cwd `ContextVar` and the terminal/file task cwd for the gateway session ID, then restores their previous values after the turn. The workspace marker is another task-local `ContextVar`, so concurrent routed and unrouted turns do not share state.
+The plugin does not change the process cwd or the terminal backend's shared default environment cwd. Routed gateway sessions keep the configured backend type but use the gateway session ID as an isolated terminal environment and file-operations cache key. The plugin binds Hermes' session-scoped cwd `ContextVar` and the terminal/file cwd records for that ID, then restores their previous values after the turn. Overlapping bindings use an ownership stack, while the workspace marker remains task-local, so concurrent routed and unrouted turns do not share state. Hermes may retain the session-keyed environment between matching routed turns for shell continuity and idle cleanup; if the same session ID later becomes unrouted, the plugin removes that environment and file cache before the turn starts.
 
 MCP servers live in Hermes' process-wide MCP registry because Hermes manages MCP connections globally. The plugin namespaces server names as `workspace-<workspace>-<server>` and adds their toolsets only to matching turns. Unmatched turns cannot discover those tools through their enabled toolset catalog.
 
@@ -142,7 +142,7 @@ This plugin intentionally uses Hermes private APIs because the public plugin API
 
 - gateway instance methods `_set_session_env()` and `_clear_session_env()`;
 - `agent.runtime_cwd.set_session_cwd()` returning a `ContextVar` token;
-- task cwd helpers and registries in `tools.terminal_tool`;
+- task override and session cwd registries in `tools.terminal_tool`;
 - skill discovery helpers in `agent.skill_utils`, `agent.prompt_builder`, and `tools.skills_tool`;
 - `hermes_cli.tools_config._get_platform_tools()`;
 - `tools.mcp_tool.register_mcp_servers()`.

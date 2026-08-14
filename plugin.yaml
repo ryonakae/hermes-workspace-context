@@ -1,5 +1,5 @@
 name: hermes-workspace-context
-version: "1.1.0"
+version: "1.1.1"
 description: Apply project workspace contexts to selected gateway conversations.
 author: Ryo Nakae
 hooks:
