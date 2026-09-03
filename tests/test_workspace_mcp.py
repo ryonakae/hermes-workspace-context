@@ -132,6 +132,43 @@ def test_mcp_toolsets_are_added_only_inside_matching_workspace(tmp_path: Path) -
     assert set(registered[0]) == {"workspace-my-app-docs", "workspace-my-app-remote"}
 
 
+def test_workspace_mcp_servers_are_registered_lazy_by_default(tmp_path: Path) -> None:
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "local": {"command": "local-server", "args": []},
+                    "remote": {"type": "http", "url": "https://example.invalid/mcp"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    tools_config = SimpleNamespace(_get_platform_tools=lambda *_args, **_kwargs: set())
+    registered: list[dict] = []
+
+    install_mcp_patches(
+        workspaces={"My App": workspace(tmp_path)},
+        tools_config=tools_config,
+        register_mcp_servers=lambda servers: registered.append(servers) or [],
+    )
+
+    assert registered == [
+        {
+            "workspace-my-app-local": {
+                "command": "local-server",
+                "args": [],
+                "lazy": True,
+            },
+            "workspace-my-app-remote": {
+                "url": "https://example.invalid/mcp",
+                "auth": "oauth",
+                "lazy": True,
+            },
+        }
+    ]
+
+
 def test_mcp_patch_is_idempotent(tmp_path: Path) -> None:
     (tmp_path / ".mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
     tools_config = SimpleNamespace(_get_platform_tools=lambda *_args, **_kwargs: {"skills"})

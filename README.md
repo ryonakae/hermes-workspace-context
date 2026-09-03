@@ -115,6 +115,8 @@ Missing skill directories and MCP files are allowed. A missing workspace `cwd` i
 
 Remote OAuth defaults are preserved during conversion: Claude Code, Codex, and OpenCode remote entries become Hermes `auth: oauth` unless they explicitly disable OAuth or provide an `Authorization` header. OpenCode timeouts are converted from milliseconds to Hermes seconds. A Codex server using `auth = "chatgpt"` is skipped because Hermes cannot safely reproduce that credential source.
 
+Workspace MCP servers are registered with Hermes `lazy: true` by default. When Hermes has a matching schema-cache entry, tools remain discoverable without connecting to every server during gateway startup; the first tool call establishes the live connection. A missing or stale cache still uses Hermes' normal eager connection once to refresh the schema. An explicit `lazy: false` in a workspace Hermes MCP entry is preserved.
+
 ### `routes`
 
 Each route accepts:

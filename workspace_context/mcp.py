@@ -550,7 +550,11 @@ def install_mcp_patches(
         overlap = set(all_servers).intersection(servers)
         if overlap:
             raise McpConfigError(f"duplicate namespaced MCP server(s): {', '.join(sorted(overlap))}")
-        all_servers.update(servers)
+        registration_servers = {
+            name: {"lazy": True, **config}
+            for name, config in servers.items()
+        }
+        all_servers.update(registration_servers)
         server_names_by_workspace[workspace.name] = tuple(servers)
 
     register_mcp_servers(all_servers)
