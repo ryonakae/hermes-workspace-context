@@ -25,8 +25,9 @@ PYTHONPATH=.:$HOME/.hermes/hermes-agent PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python 
 - `workspace_context/config.py`: local YAML validation and path resolution.
 - `workspace_context/runtime.py`: gateway route matching and prompt/tool cwd lifecycle.
 - `workspace_context/skills.py`: read-only project skill overlays.
-- `workspace_context/mcp.py`: Claude/Codex/OpenCode/Hermes MCP discovery, conversion, merging, namespacing, registration, and toolset scoping.
-- `workspace_context/plugin.py`: startup orchestration.
+- `workspace_context/mcp.py`: Claude/Codex/OpenCode/Hermes MCP discovery, conversion, merging, namespacing, registration, OAuth reauthentication, and toolset scoping.
+- `workspace_context/diagnostics.py`: bounded structured gateway diagnostics with opaque request/session references.
+- `workspace_context/plugin.py`: startup orchestration and workspace-context CLI registration.
 - `tests/`: unit and active-Hermes compatibility tests.
 - `.hermes/plans/`: implementation plan and private API rationale.
 
@@ -38,6 +39,7 @@ PYTHONPATH=.:$HOME/.hermes/hermes-agent PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python 
 - Store per-turn prompt state in `ContextVar`; keep shared tool-cwd state ownership-tracked and restore it in `finally` blocks without mutating a shared live environment cwd.
 - Namespace MCP server names before inserting them into Hermes' global registry.
 - Skip only the conflicting server when project MCP files reuse a name for different connection targets. Never log URLs, headers, environment values, or OAuth credentials in conflict warnings.
+- Keep diagnostics structured and non-sensitive: log component/status metadata and opaque references, never message bodies, channel/thread IDs, URLs, headers, environment values, or credentials.
 - Do not add workspace MCP toolsets to unrouted turns.
 - Keep project skill access read-only. Do not redirect `skill_manage` into project directories.
 - Treat missing workspace `cwd`, unknown route targets, and unset MCP environment variables as configuration errors.

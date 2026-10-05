@@ -9,15 +9,17 @@ import tomllib
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, cast
 
 import yaml
 
 from .config import Workspace
+from .diagnostics import component_logger, log_event, runner_fields
 from .runtime import current_workspace
 
 
 _PATCH_MARKER = "_hermes_workspace_context_mcp_patch"
+_LOGGER = component_logger("mcp")
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _ENV_COLON_PATTERN = re.compile(r"\$?\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
 _SAFE_NAME_PATTERN = re.compile(r"[^a-z0-9]+")
@@ -525,6 +527,50 @@ def load_workspace_mcp_servers(
     return _merge_entries(workspace, _entries_from(path, "claude", "mcpServers", "json", source))
 
 
+def _core_reauth_oauth_server() -> Callable[..., bool]:
+    """Return Hermes' private OAuth reauthentication adapter."""
+    try:
+        from hermes_cli.mcp_config import _reauth_oauth_server
+    except (ImportError, AttributeError):
+        raise McpConfigError(
+            "Hermes MCP OAuth reauthentication API is unavailable in this runtime"
+        ) from None
+    if not callable(_reauth_oauth_server):
+        raise McpConfigError(
+            "Hermes MCP OAuth reauthentication API is unavailable in this runtime"
+        )
+    return cast(Callable[..., bool], _reauth_oauth_server)
+
+
+def reauth_workspace_mcp_server(
+    workspace: Workspace,
+    server_name: str,
+    *,
+    flow: str | None = None,
+) -> bool:
+    """Re-authenticate one namespaced OAuth MCP server from workspace config.
+
+    The namespace is passed to Hermes so the OAuth token remains scoped to this
+    workspace entry rather than colliding with a global server of the same name.
+    """
+    namespaced_name = namespace_server_name(workspace.name, server_name)
+    servers = load_workspace_mcp_servers(workspace)
+    server_config = servers.get(namespaced_name)
+    if server_config is None:
+        raise McpConfigError(
+            f"unknown MCP server {server_name!r} in workspace {workspace.name!r}"
+        )
+    if not server_config.get("url"):
+        raise McpConfigError(
+            f"workspace MCP server {server_name!r} is not OAuth-capable (no URL)"
+        )
+    if server_config.get("auth") != "oauth":
+        raise McpConfigError(
+            f"workspace MCP server {server_name!r} is not configured for OAuth"
+        )
+    return bool(_core_reauth_oauth_server()(namespaced_name, server_config, flow=flow))
+
+
 def install_mcp_patches(
     *,
     workspaces: Mapping[str, Workspace],
@@ -535,7 +581,8 @@ def install_mcp_patches(
     if tools_config is None:
         from hermes_cli import tools_config as tools_config
     if register_mcp_servers is None:
-        from tools.mcp_tool import register_mcp_servers
+        from tools.mcp_tool_discovery import register_mcp_servers
+    register_servers = cast(Callable[[dict[str, dict[str, Any]]], list[str]], register_mcp_servers)
 
     if getattr(tools_config, _PATCH_MARKER, False):
         return
@@ -544,6 +591,7 @@ def install_mcp_patches(
         raise McpConfigError("Hermes tools_config is missing _get_platform_tools private API")
 
     server_names_by_workspace: dict[str, tuple[str, ...]] = {}
+    servers_by_workspace: dict[str, dict[str, dict[str, Any]]] = {}
     all_servers: dict[str, dict[str, Any]] = {}
     for workspace in workspaces.values():
         servers = load_workspace_mcp_servers(workspace)
@@ -556,16 +604,67 @@ def install_mcp_patches(
         }
         all_servers.update(registration_servers)
         server_names_by_workspace[workspace.name] = tuple(servers)
+        servers_by_workspace[workspace.name] = registration_servers
 
-    register_mcp_servers(all_servers)
+    register_servers(all_servers)
+
+    def _register_workspace_servers_in_active_profile(workspace_name: str) -> None:
+        """Materialize this routed workspace's MCP entries in the active profile overlay.
+
+        Plugin discovery can run before a multiplexed gateway binds a routed profile, so
+        ``register_mcp_servers`` may initially create a process-global lazy entry. The core's
+        scoped check_fn correctly rejects that entry from a routed profile. Re-running only the
+        current workspace's lazy registrations inside the active scope lets the core register
+        the same cached schemas in that profile without copying unrelated workspaces or
+        weakening availability/trust checks.
+        """
+        try:
+            from tools.mcp_tool import _mcp_registry_scope
+            if _mcp_registry_scope() is None:
+                return
+        except (ImportError, AttributeError):
+            return
+        scoped_servers = servers_by_workspace.get(workspace_name, {})
+        if not scoped_servers:
+            return
+        registered = register_servers(scoped_servers)
+        log_event(
+            _LOGGER,
+            "scoped_mcp_registration",
+            workspace=workspace_name,
+            candidate_count=len(scoped_servers),
+            registered_count=len(registered),
+            **runner_fields(),
+        )
 
     def routed_get_platform_tools(config: dict, platform: str, **kwargs: Any):
         enabled = set(original_get_platform_tools(config, platform, **kwargs))
+        base_count = len(enabled)
         workspace = current_workspace()
-        if workspace is None:
-            return enabled
-        for server_name in server_names_by_workspace.get(workspace.name, ()):
-            enabled.add(f"mcp-{server_name}")
+        added_count = 0
+        candidate_count = 0
+        workspace_name = "none"
+        if workspace is not None:
+            workspace_name = workspace.name
+            _register_workspace_servers_in_active_profile(workspace.name)
+            server_names = server_names_by_workspace.get(workspace.name, ())
+            candidate_count = len(server_names)
+            for server_name in server_names:
+                toolset_name = f"mcp-{server_name}"
+                if toolset_name not in enabled:
+                    enabled.add(toolset_name)
+                    added_count += 1
+        log_event(
+            _LOGGER,
+            "enabled_toolsets",
+            platform=platform,
+            workspace=workspace_name,
+            base_toolset_count=base_count,
+            workspace_mcp_candidate_count=candidate_count,
+            workspace_mcp_added_count=added_count,
+            resolved_toolset_count=len(enabled),
+            **runner_fields(),
+        )
         return enabled
 
     tools_config._get_platform_tools = routed_get_platform_tools

@@ -75,6 +75,31 @@ Send a message to a configured gateway channel. Hermes will handle that turn as 
 
 Messages in unmatched channels continue with the normal profile environment.
 
+### CLI-only MCP reauthentication
+
+Reauthenticate one OAuth-enabled workspace MCP server without loading the workspace
+MCP servers into the process or editing Hermes' global `mcp_servers` configuration:
+
+```bash
+hermes workspace-context mcp reauth <workspace> <server>
+hermes workspace-context mcp reauth <workspace> <server> --flow device
+```
+
+`<workspace>` is a key under `workspaces`. `<server>` is the un-namespaced server
+name from the workspace MCP file (for example, `docs`); Hermes receives the
+namespaced key `workspace-<workspace>-<server>` so its OAuth token storage remains
+workspace-scoped. The command reloads `config.yaml` and the workspace MCP file at
+execution time, rejects unknown workspaces/servers and non-OAuth entries before
+starting authentication, and returns a non-zero exit status when authentication
+fails. It does not support or trigger a Slack authentication flow.
+
+Plugin discovery for this command registers only the CLI parser. Workspace skill
+patches, MCP registration, and gateway hooks are skipped until a normal gateway
+load, so `--help` and command parsing do not connect every configured MCP server.
+After a successful reauthentication, restart the gateway (or use its normal
+reload/restart command) before relying on an already-running process; automatic
+recovery of an existing live MCP connection is not verified by this plugin.
+
 A route may target a whole channel or a single thread:
 
 ```yaml
@@ -146,8 +171,10 @@ This plugin intentionally uses Hermes private APIs because the public plugin API
 - `agent.runtime_cwd.set_session_cwd()` returning a `ContextVar` token;
 - task override and session cwd registries in `tools.terminal_tool`;
 - skill discovery helpers in `agent.skill_utils`, `agent.prompt_builder`, and `tools.skills_tool`;
+- current Hermes skill snapshots use `agent.prompt_builder._load_skills_snapshot()` and `_skills_prompt_snapshot_path()`; the plugin redirects routed project snapshots into Hermes scratch, while older cores with `_write_skills_snapshot()` are supported when present;
 - `hermes_cli.tools_config._get_platform_tools()`;
-- `tools.mcp_tool.register_mcp_servers()`.
+- `tools.mcp_tool_discovery.register_mcp_servers()`;
+- `hermes_cli.mcp_config._reauth_oauth_server()` for the CLI-only OAuth adapter. This private call is isolated in `workspace_context/mcp.py`, receives the namespaced server key, and is validated before use.
 
 The plugin fails closed when required gateway or toolset APIs disappear. Run the test suite after upgrading Hermes.
 

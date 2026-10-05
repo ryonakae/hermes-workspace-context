@@ -1,4 +1,5 @@
 import json
+import logging
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -130,6 +131,55 @@ def test_mcp_toolsets_are_added_only_inside_matching_workspace(tmp_path: Path) -
     assert unrouted == {"terminal", "skills"}
     assert len(registered) == 1
     assert set(registered[0]) == {"workspace-my-app-docs", "workspace-my-app-remote"}
+
+
+def test_mcp_toolset_resolution_logs_workspace_additions_without_secrets(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "docs": {"type": "stdio", "command": "docs", "args": []},
+                    "remote": {
+                        "type": "http",
+                        "url": "https://private.invalid/mcp?token=do-not-log",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    tools_config = SimpleNamespace(
+        _get_platform_tools=lambda _config, _platform, **_kwargs: {"terminal", "skills"}
+    )
+    install_mcp_patches(
+        workspaces={"My App": workspace(tmp_path)},
+        tools_config=tools_config,
+        register_mcp_servers=lambda _servers: [],
+    )
+    caplog.set_level(logging.INFO, logger="gateway.plugins.hermes_workspace_context")
+
+    token = _CURRENT_WORKSPACE.set(workspace(tmp_path))
+    try:
+        routed = tools_config._get_platform_tools({}, "slack")
+    finally:
+        _CURRENT_WORKSPACE.reset(token)
+    unrouted = tools_config._get_platform_tools({}, "slack")
+
+    assert routed == {
+        "terminal",
+        "skills",
+        "mcp-workspace-my-app-docs",
+        "mcp-workspace-my-app-remote",
+    }
+    assert unrouted == {"terminal", "skills"}
+    messages = "\\n".join(record.getMessage() for record in caplog.records)
+    assert "event=enabled_toolsets" in messages
+    assert "workspace_mcp_added_count=2" in messages
+    assert "workspace_mcp_added_count=0" in messages
+    assert "private.invalid" not in messages
+    assert "do-not-log" not in messages
 
 
 def test_workspace_mcp_servers_are_registered_lazy_by_default(tmp_path: Path) -> None:

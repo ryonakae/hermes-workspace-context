@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, cast
 
 from .runtime import current_workspace
 
@@ -32,6 +33,20 @@ def _dedupe(paths: list[Path]) -> list[Path]:
             seen.add(resolved)
             result.append(resolved)
     return result
+
+
+def _workspace_snapshot_path(root: Path) -> Path:
+    """Keep Hermes' prompt snapshot cache isolated from the profile snapshot."""
+    from hermes_constants import get_scratch_dir  # type: ignore[import-not-found]
+
+    identity = str(root.resolve()).encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()
+    return (
+        get_scratch_dir()
+        / "hermes-workspace-context"
+        / "skill-snapshots"
+        / f"{digest}.json"
+    )
 
 
 def _frontmatter_name(skill_md: Path) -> str | None:
@@ -91,7 +106,8 @@ def install_skill_patches(
     original_all = skill_utils.get_all_skills_dirs
     original_prompt_skills_dir = prompt_builder.get_skills_dir
     original_load_snapshot = prompt_builder._load_skills_snapshot
-    original_write_snapshot = prompt_builder._write_skills_snapshot
+    original_snapshot_path = getattr(prompt_builder, "_skills_prompt_snapshot_path", None)
+    original_write_snapshot = getattr(prompt_builder, "_write_skills_snapshot", None)
     original_tool_skills_dir = skills_tool._skills_dir
     original_skill_view = skills_tool.skill_view
 
@@ -124,9 +140,19 @@ def install_skill_patches(
             return None
         return original_load_snapshot(root)
 
+    def routed_snapshot_path() -> Path:
+        roots = _existing_project_roots()
+        if roots:
+            return _workspace_snapshot_path(roots[0])
+        if not callable(original_snapshot_path):
+            raise RuntimeError("Hermes prompt builder snapshot path API is unavailable")
+        return cast(Callable[[], Path], original_snapshot_path)()
+
     def routed_write_snapshot(*args: Any, **kwargs: Any):
         if _existing_project_roots():
             return None
+        if not callable(original_write_snapshot):
+            raise RuntimeError("Hermes prompt builder snapshot writer API is unavailable")
         return original_write_snapshot(*args, **kwargs)
 
     def routed_skill_view(name: str, *args: Any, **kwargs: Any):
@@ -143,7 +169,10 @@ def install_skill_patches(
     prompt_builder.get_skills_dir = routed_prompt_skills_dir
     prompt_builder.get_all_skills_dirs = routed_all_dirs
     prompt_builder._load_skills_snapshot = routed_load_snapshot
-    prompt_builder._write_skills_snapshot = routed_write_snapshot
+    if callable(original_snapshot_path):
+        setattr(prompt_builder, "_skills_prompt_snapshot_path", routed_snapshot_path)
+    if callable(original_write_snapshot):
+        setattr(prompt_builder, "_write_skills_snapshot", routed_write_snapshot)
     skills_tool._skills_dir = routed_tool_skills_dir
     skills_tool.skill_view = routed_skill_view
     setattr(skill_utils, _PATCH_MARKER, True)

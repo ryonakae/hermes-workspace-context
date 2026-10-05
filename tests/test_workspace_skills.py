@@ -64,6 +64,43 @@ def test_routed_skill_roots_put_project_before_global(tmp_path: Path) -> None:
         _CURRENT_WORKSPACE.reset(token)
 
 
+def test_current_prompt_builder_without_snapshot_writer_is_supported(tmp_path: Path) -> None:
+    project_root = tmp_path / "project" / ".agents" / "skills"
+    global_root = tmp_path / "global"
+    external_root = tmp_path / "external"
+    for root in (project_root, global_root, external_root):
+        root.mkdir(parents=True)
+
+    skill_utils = SimpleNamespace(
+        get_external_skills_dirs=lambda: [external_root],
+        get_all_skills_dirs=lambda: [global_root, external_root],
+    )
+    # Current Hermes keeps snapshot loading but removed the old writer helper.
+    prompt_builder = SimpleNamespace(
+        get_skills_dir=lambda: global_root,
+        get_all_skills_dirs=lambda: [global_root, external_root],
+        _load_skills_snapshot=lambda _root: None,
+    )
+    skills_tool = SimpleNamespace(
+        _skills_dir=lambda: global_root,
+        skill_view=lambda name, **_kwargs: json.dumps({"name": name}),
+    )
+
+    install_skill_patches(
+        skill_utils=skill_utils,
+        prompt_builder=prompt_builder,
+        skills_tool=skills_tool,
+    )
+
+    token = _CURRENT_WORKSPACE.set(workspace(tmp_path / "project"))
+    try:
+        assert skill_utils.get_all_skills_dirs() == [project_root, global_root, external_root]
+        assert prompt_builder.get_skills_dir() == project_root
+        assert skills_tool._skills_dir() == project_root
+    finally:
+        _CURRENT_WORKSPACE.reset(token)
+
+
 def test_routed_skill_roots_do_not_recurse_when_all_dirs_calls_external(tmp_path: Path) -> None:
     project_root = tmp_path / "project" / ".agents" / "skills"
     global_root = tmp_path / "global"

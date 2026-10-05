@@ -8,12 +8,14 @@ import threading
 from typing import Any, Callable
 
 from .config import Route, RouterConfig, Workspace
+from .diagnostics import component_logger, log_event, opaque_ref, runner_fields
 
 
 _CURRENT_WORKSPACE: ContextVar[Workspace | None] = ContextVar(
     "hermes_workspace_context_current_workspace",
     default=None,
 )
+_LOGGER = component_logger("runtime")
 _PATCH_MARKER = "_hermes_workspace_context_patch"
 
 
@@ -330,6 +332,13 @@ def install_gateway_patches(
 ) -> None:
     """Wrap one gateway instance's session scope without changing process cwd."""
     if getattr(gateway, _PATCH_MARKER, False):
+        log_event(
+            _LOGGER,
+            "gateway_patch",
+            phase="install",
+            result="already_installed",
+            **runner_fields(),
+        )
         return
 
     original_set = getattr(gateway, "_set_session_env", None)
@@ -345,23 +354,67 @@ def install_gateway_patches(
     reset_tools = reset_tool_cwd or _default_reset_tool_cwd
 
     def routed_set(context: Any) -> RoutedSessionTokens:
-        workspace = workspace_for_source(config, context.source)
+        source = context.source
+        workspace = workspace_for_source(config, source)
+        session_id = str(getattr(context, "session_id", "") or "")
+        route = "matched" if workspace is not None else "unmatched"
+        log_event(
+            _LOGGER,
+            "routed_set",
+            phase="workspace_selected",
+            route=route,
+            workspace=workspace.name if workspace is not None else "none",
+            platform=_platform_name(source),
+            session_ref=opaque_ref(session_id),
+            thread_ref=opaque_ref(getattr(source, "thread_id", None)),
+            **runner_fields(),
+        )
         workspace_token = _CURRENT_WORKSPACE.set(workspace)
         hermes_tokens = None
         cwd_token = None
         tool_cwd_token = None
+        stage = "hermes_session_env"
         try:
             hermes_tokens = original_set(context)
-            session_id = str(getattr(context, "session_id", "") or "")
+            log_event(
+                _LOGGER,
+                "routed_set",
+                phase="hermes_session_env",
+                result="success",
+                workspace=workspace.name if workspace is not None else "none",
+                session_ref=opaque_ref(session_id),
+                **runner_fields(),
+            )
             if workspace is not None:
+                stage = "workspace_session_cwd"
                 cwd_token = bind_cwd(str(workspace.cwd))
                 if not session_id:
                     raise CompatibilityError(
                         "Hermes gateway session context is missing session_id"
                     )
+                stage = "workspace_tool_cwd"
                 tool_cwd_token = bind_tools(session_id, str(workspace.cwd))
+                log_event(
+                    _LOGGER,
+                    "workspace_binding",
+                    result="bound",
+                    workspace=workspace.name,
+                    session_ref=opaque_ref(session_id),
+                    thread_ref=opaque_ref(getattr(source, "thread_id", None)),
+                    **runner_fields(),
+                )
             elif session_id:
+                stage = "unrouted_cleanup"
                 _cleanup_plugin_isolation_for_unrouted_session(session_id)
+                log_event(
+                    _LOGGER,
+                    "workspace_binding",
+                    result="skipped",
+                    route="unmatched",
+                    workspace="none",
+                    session_ref=opaque_ref(session_id),
+                    **runner_fields(),
+                )
             return RoutedSessionTokens(
                 hermes_tokens=hermes_tokens,
                 workspace_token=workspace_token,
@@ -369,7 +422,17 @@ def install_gateway_patches(
                 tool_cwd_token=tool_cwd_token,
                 routed=workspace is not None,
             )
-        except BaseException:
+        except BaseException as exc:
+            log_event(
+                _LOGGER,
+                "routed_set",
+                result="error",
+                phase=stage,
+                error_type=type(exc).__name__,
+                workspace=workspace.name if workspace is not None else "none",
+                session_ref=opaque_ref(session_id),
+                **runner_fields(),
+            )
             try:
                 if tool_cwd_token is not None:
                     reset_tools(tool_cwd_token)
@@ -389,6 +452,14 @@ def install_gateway_patches(
         if not isinstance(tokens, RoutedSessionTokens):
             original_clear(tokens)
             return
+        workspace = current_workspace()
+        log_event(
+            _LOGGER,
+            "session_env_clear",
+            routed="true",
+            workspace=workspace.name if workspace is not None else "none",
+            **runner_fields(),
+        )
         try:
             original_clear(tokens.hermes_tokens)
         finally:
@@ -405,12 +476,29 @@ def install_gateway_patches(
     gateway._set_session_env = routed_set
     gateway._clear_session_env = routed_clear
     setattr(gateway, _PATCH_MARKER, True)
+    log_event(
+        _LOGGER,
+        "gateway_patch",
+        phase="install",
+        result="installed",
+        **runner_fields(),
+    )
 
 
 def make_pre_gateway_dispatch(config: RouterConfig):
     """Create the public hook that installs private compatibility adapters once."""
 
     def pre_gateway_dispatch(*, event: Any, gateway: Any, **_kwargs: Any) -> None:
+        source = getattr(event, "source", None)
+        log_event(
+            _LOGGER,
+            "pre_gateway_dispatch",
+            hook="pre_gateway_dispatch",
+            platform=_platform_name(source),
+            thread_ref=opaque_ref(getattr(source, "thread_id", None)),
+            workspace_count=len(config.workspaces),
+            **runner_fields(),
+        )
         install_gateway_patches(gateway, config)
         return None
 

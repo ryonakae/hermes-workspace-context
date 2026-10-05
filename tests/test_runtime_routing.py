@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -61,6 +62,40 @@ def test_pre_gateway_dispatch_installs_idempotent_patches(tmp_path: Path) -> Non
     hook(event=SimpleNamespace(source=source("C_TARGET")), gateway=gateway)
 
     assert gateway._set_session_env == first_set
+
+
+def test_gateway_diagnostics_trace_hook_route_and_binding_without_sensitive_values(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    gateway = FakeGateway()
+    hook = make_pre_gateway_dispatch(router_config(tmp_path))
+    caplog.set_level(logging.INFO, logger="gateway.plugins.hermes_workspace_context")
+    secret_body = "assistant-body-must-not-be-logged"
+    secret_channel = "C_TARGET"
+    secret_thread = "thread-secret"
+
+    hook(
+        event=SimpleNamespace(source=source(secret_channel, secret_thread)),
+        gateway=gateway,
+    )
+    routed_context = context("C_TARGET", secret_body)
+    routed_context.source = source(secret_channel, secret_thread)
+    tokens = gateway._set_session_env(routed_context)
+    gateway._clear_session_env(tokens)
+
+    messages = "\\n".join(record.getMessage() for record in caplog.records)
+    assert "event=pre_gateway_dispatch" in messages
+    assert "event=routed_set" in messages
+    assert "route=matched" in messages
+    assert "workspace=app" in messages
+    assert "event=session_env_clear" in messages
+    assert "session_ref=" in messages
+    assert "runner_pid=" in messages
+    assert "runner_thread_id=" in messages
+    assert "runner_task_ref=" in messages
+    assert secret_body not in messages
+    assert secret_channel not in messages
+    assert secret_thread not in messages
 
 
 def test_routed_context_sets_workspace_and_cwd_until_clear(tmp_path: Path) -> None:
