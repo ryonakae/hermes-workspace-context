@@ -983,21 +983,40 @@ def install_mcp_patches(
             manager = managers.get(_profile_home_key())
             return manager if isinstance(manager, WorkspaceMcpManager) else None
 
+    def _refresh_native_server_names(active_manager: WorkspaceMcpManager) -> None:
+        """Refresh the native-name collision set without re-entering the patched loader."""
+        try:
+            from tools import mcp_tool_config
+            marker = getattr(mcp_tool_config, _CONFIG_PATCH_MARKER, None)
+            native_loader = marker.get("original_loader") if isinstance(marker, dict) else None
+            native = native_loader() if callable(native_loader) else None
+        except Exception:
+            return
+        if isinstance(native, dict):
+            with active_manager._lock:
+                active_manager._blocked_names = set(native)
+
     def _register_workspace_servers_in_active_profile(workspace: Workspace) -> dict[str, dict[str, Any]]:
         active_manager = _active_profile_manager()
         if active_manager is None:
             return {}
+        scoped: str | None = None
+        try:
+            from tools.mcp_tool import _mcp_registry_scope
+            scoped = _mcp_registry_scope()
+        except (ImportError, AttributeError):
+            scoped = None
+        try:
+            from tools.registry import registry
+        except (ImportError, AttributeError):
+            registry = None
+        if scoped is None:
+            _refresh_native_server_names(active_manager)
         scoped_servers = {
             name: {"lazy": True, **config}
             for name, config in active_manager.current_servers(workspace).items()
         }
-        try:
-            from tools.mcp_tool import _mcp_registry_scope
-            from tools.registry import registry
-            scoped = _mcp_registry_scope()
-        except (ImportError, AttributeError):
-            scoped = None
-        if scoped is not None and scoped_servers:
+        if scoped_servers and registry is not None:
             missing_servers = {
                 name: config
                 for name, config in scoped_servers.items()
@@ -1013,6 +1032,7 @@ def install_mcp_patches(
                 workspace=workspace.name,
                 candidate_count=len(missing_servers),
                 registered_count=len(registered),
+                registry_scope="global" if scoped is None else "profile",
                 **runner_fields(),
             )
         return scoped_servers

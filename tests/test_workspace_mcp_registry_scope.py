@@ -399,3 +399,183 @@ def test_routed_workspace_mcp_is_visible_in_real_core_registry_scope(tmp_path: P
     assert completed.returncode == 0, completed.stderr + "\n" + completed.stdout
     result = json.loads(completed.stdout.strip().splitlines()[-1])
     assert result["routed_visible"] is True
+
+
+def test_single_profile_turn_registers_workspace_mcp_before_tool_definitions(tmp_path: Path) -> None:
+    """The first real gateway turn must see a newly refreshed workspace MCP generation."""
+    plugin_dir = tmp_path / "plugin"
+    project = tmp_path / "project"
+    hermes_home = tmp_path / "hermes-home"
+    plugin_dir.mkdir()
+    project.mkdir()
+    hermes_home.mkdir()
+    (project / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "sentry": {
+                        "type": "http",
+                        "url": "https://example.invalid/mcp",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (plugin_dir / "config.yaml").write_text(
+        f"""
+workspaces:
+  app:
+    cwd: {project}
+    skill_dirs: []
+    mcp_file: {project / '.mcp.json'}
+    auto_detect_mcp: false
+routes:
+  - platform: slack
+    chat_id: C_TARGET
+    workspace: app
+""",
+        encoding="utf-8",
+    )
+
+    repo_root = Path(__file__).resolve().parents[1]
+    core_root = Path(sys.executable).resolve().parent.parent.parent
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from gateway.run import GatewayRunner
+        from model_tools import get_tool_definitions
+        from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+        from workspace_context.config import load_config
+        from workspace_context.mcp import _config_fingerprint, load_workspace_mcp_servers
+        from workspace_context.plugin import register_plugin
+
+        class Context:
+            def __init__(self):
+                self.hooks = []
+                self.cli = []
+
+            def register_hook(self, name, callback):
+                self.hooks.append((name, callback))
+
+            def register_cli_command(self, name, **kwargs):
+                self.cli.append(name)
+
+        class Gateway:
+            def _set_session_env(self, context):
+                return context.session_id
+
+            def _clear_session_env(self, token):
+                return None
+
+        plugin_dir = Path(os.environ["PLUGIN_DIR"])
+        config = load_config(plugin_dir / "config.yaml")
+        workspace = config.workspaces["app"]
+
+        def cache_current_server(tool_name, *, actual_name=None):
+            logical_name, server_config = next(iter(load_workspace_mcp_servers(workspace).items()))
+            cache_name = actual_name or logical_name
+            write_cache_entry(
+                cache_name,
+                config_fingerprint({"lazy": True, **server_config}),
+                tools=[
+                    {
+                        "name": tool_name,
+                        "description": "Find Sentry organizations.",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ],
+            )
+            return logical_name, server_config, cache_name
+
+        server_name, _, _ = cache_current_server("find_organizations")
+
+        ctx = Context()
+        register_plugin(ctx, plugin_dir=plugin_dir, install_skill_patches=lambda: None)
+        hook = next(callback for name, callback in ctx.hooks if name == "pre_gateway_dispatch")
+        source = SimpleNamespace(platform="slack", chat_id="C_TARGET", thread_id=None)
+        gateway = Gateway()
+        hook(event=SimpleNamespace(source=source), gateway=gateway)
+
+        def resolve_turn(session_id):
+            context = SimpleNamespace(source=source, session_id=session_id)
+            tokens = gateway._set_session_env(context)
+            try:
+                runner = object.__new__(GatewayRunner)
+                runner._delivery_adapter_for = lambda _source: None
+                enabled, disabled = GatewayRunner._resolve_turn_toolsets(
+                    runner,
+                    {"platform_toolsets": {"slack": ["terminal"]}},
+                    source,
+                    "slack",
+                )
+                definitions = get_tool_definitions(
+                    enabled_toolsets=enabled,
+                    disabled_toolsets=disabled,
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                )
+            finally:
+                gateway._clear_session_env(tokens)
+            return enabled, [item["function"]["name"] for item in definitions]
+
+        first_enabled, first_names = resolve_turn("single-profile-turn-1")
+
+        workspace.mcp_file.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "sentry": {
+                            "type": "http",
+                            "url": "https://example.invalid/mcp-v2",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        changed_name, changed_config = next(iter(load_workspace_mcp_servers(workspace).items()))
+        changed_generation_name = (
+            f"{changed_name}-g{_config_fingerprint(changed_config)[:12]}"
+        )
+        cache_current_server("find_organizations_v2", actual_name=changed_generation_name)
+        second_enabled, second_names = resolve_turn("single-profile-turn-2")
+
+        expected_tool = f"mcp__{server_name.replace('-', '_')}__find_organizations"
+        expected_changed_tool = (
+            f"mcp__{changed_generation_name.replace('-', '_')}__find_organizations_v2"
+        )
+        print(json.dumps({
+            "first_enabled_workspace_toolset": f"mcp-{server_name}" in first_enabled,
+            "first_tool": expected_tool,
+            "first_visible": expected_tool in first_names,
+            "changed_enabled_workspace_toolset": f"mcp-{changed_generation_name}" in second_enabled,
+            "changed_tool": expected_changed_tool,
+            "changed_visible": expected_changed_tool in second_names,
+        }))
+        assert f"mcp-{server_name}" in first_enabled
+        assert expected_tool in first_names
+        assert f"mcp-{changed_generation_name}" in second_enabled
+        assert expected_changed_tool in second_names
+        """
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    env["PLUGIN_DIR"] = str(plugin_dir)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(repo_root), str(core_root), env.get("PYTHONPATH")) if part
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr + "\n" + completed.stdout

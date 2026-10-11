@@ -130,7 +130,16 @@ def test_mcp_toolsets_are_added_only_inside_matching_workspace(tmp_path: Path) -
         "mcp-workspace-my-app-remote",
     }
     assert unrouted == {"terminal", "skills"}
-    assert registered == []
+    assert registered == [
+        {
+            "workspace-my-app-docs": {"command": "docs", "args": [], "lazy": True},
+            "workspace-my-app-remote": {
+                "url": "https://example.invalid/mcp",
+                "auth": "oauth",
+                "lazy": True,
+            },
+        }
+    ]
 
 
 def test_mcp_toolset_resolution_logs_workspace_additions_without_secrets(
