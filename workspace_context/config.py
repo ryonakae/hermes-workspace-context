@@ -123,6 +123,8 @@ def load_config(path: str | Path) -> RouterConfig:
 
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except UnicodeDecodeError:
+        raise ConfigError(f"invalid UTF-8 in {config_path}") from None
     except yaml.YAMLError as exc:
         raise ConfigError(f"invalid YAML in {config_path}: {exc}") from exc
     root = _mapping(raw, "config")

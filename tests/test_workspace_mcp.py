@@ -239,6 +239,163 @@ def test_mcp_patch_is_idempotent(tmp_path: Path) -> None:
     assert register_calls == []
 
 
+def test_mcp_loader_keeps_managers_isolated_per_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import mcp_tool_config
+    from workspace_context import mcp
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_c = tmp_path / "profile-c"
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    for path in (profile_a, profile_b, profile_c, project_a, project_b):
+        path.mkdir()
+    (project_a / ".mcp.json").write_text(
+        '{"mcpServers": {"docs": {"command": "docs-a"}}}', encoding="utf-8"
+    )
+    (project_b / ".mcp.json").write_text(
+        '{"mcpServers": {"docs": {"command": "docs-b"}}}', encoding="utf-8"
+    )
+    workspace_a = workspace(project_a, "app")
+    workspace_b = workspace(project_b, "app")
+    router_a = RouterConfig(workspaces={"app": workspace_a}, routes=())
+    router_b = RouterConfig(workspaces={"app": workspace_b}, routes=())
+
+    monkeypatch.delattr(mcp_tool_config, mcp._CONFIG_PATCH_MARKER, raising=False)
+    monkeypatch.setattr(mcp_tool_config, "_load_mcp_config", lambda: {})
+
+    token_a = set_hermes_home_override(profile_a)
+    try:
+        manager_a = mcp._install_workspace_mcp_loader(
+            workspaces=router_a.workspaces,
+            config_provider=lambda: router_a,
+        )
+        loader = mcp_tool_config._load_mcp_config
+        assert loader() == {
+            "workspace-app-docs": {"lazy": True, "command": "docs-a", "args": []}
+        }
+    finally:
+        reset_hermes_home_override(token_a)
+
+    token_b = set_hermes_home_override(profile_b)
+    try:
+        manager_b = mcp._install_workspace_mcp_loader(
+            workspaces=router_b.workspaces,
+            config_provider=lambda: router_b,
+        )
+        assert manager_b is not manager_a
+        assert loader() == {
+            "workspace-app-docs": {"lazy": True, "command": "docs-b", "args": []}
+        }
+    finally:
+        reset_hermes_home_override(token_b)
+
+    token_a = set_hermes_home_override(profile_a)
+    try:
+        assert loader() == {
+            "workspace-app-docs": {"lazy": True, "command": "docs-a", "args": []}
+        }
+    finally:
+        reset_hermes_home_override(token_a)
+
+    token_c = set_hermes_home_override(profile_c)
+    try:
+        assert loader() == {}
+    finally:
+        reset_hermes_home_override(token_c)
+
+
+def test_mcp_toolset_visibility_follows_active_profile_manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import mcp_tool_config
+    from workspace_context import mcp
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    for path in (profile_a, profile_b, project_a, project_b):
+        path.mkdir()
+    (project_a / ".mcp.json").write_text(
+        '{"mcpServers": {"docs": {"command": "docs-a"}}}', encoding="utf-8"
+    )
+    (project_b / ".mcp.json").write_text(
+        '{"mcpServers": {"docs": {"command": "docs-b"}}}', encoding="utf-8"
+    )
+    workspace_a = workspace(project_a, "app")
+    workspace_b = workspace(project_b, "app")
+    router_a = RouterConfig(workspaces={"app": workspace_a}, routes=())
+    router_b = RouterConfig(workspaces={"app": workspace_b}, routes=())
+    tools_config = SimpleNamespace(
+        _get_platform_tools=lambda _config, _platform, **_kwargs: {"terminal"}
+    )
+
+    monkeypatch.delattr(mcp_tool_config, mcp._CONFIG_PATCH_MARKER, raising=False)
+    monkeypatch.setattr(mcp_tool_config, "_load_mcp_config", lambda: {})
+
+    profile_token = set_hermes_home_override(profile_a)
+    try:
+        mcp.install_mcp_patches(
+            workspaces=router_a.workspaces,
+            config_provider=lambda: router_a,
+            tools_config=tools_config,
+            register_mcp_servers=lambda _servers: [],
+        )
+        workspace_token = _CURRENT_WORKSPACE.set(workspace_a)
+        try:
+            assert tools_config._get_platform_tools({}, "slack") == {
+                "terminal",
+                "mcp-workspace-app-docs",
+            }
+        finally:
+            _CURRENT_WORKSPACE.reset(workspace_token)
+    finally:
+        reset_hermes_home_override(profile_token)
+
+    profile_token = set_hermes_home_override(profile_b)
+    try:
+        mcp.install_mcp_patches(
+            workspaces=router_b.workspaces,
+            config_provider=lambda: router_b,
+            tools_config=tools_config,
+            register_mcp_servers=lambda _servers: [],
+        )
+        workspace_token = _CURRENT_WORKSPACE.set(workspace_b)
+        try:
+            assert tools_config._get_platform_tools({}, "slack") == {
+                "terminal",
+                "mcp-workspace-app-docs",
+            }
+            assert mcp_tool_config._load_mcp_config() == {
+                "workspace-app-docs": {"lazy": True, "command": "docs-b", "args": []}
+            }
+        finally:
+            _CURRENT_WORKSPACE.reset(workspace_token)
+    finally:
+        reset_hermes_home_override(profile_token)
+
+    profile_token = set_hermes_home_override(profile_a)
+    try:
+        workspace_token = _CURRENT_WORKSPACE.set(workspace_a)
+        try:
+            assert tools_config._get_platform_tools({}, "slack") == {
+                "terminal",
+                "mcp-workspace-app-docs",
+            }
+            assert mcp_tool_config._load_mcp_config() == {
+                "workspace-app-docs": {"lazy": True, "command": "docs-a", "args": []}
+            }
+        finally:
+            _CURRENT_WORKSPACE.reset(workspace_token)
+    finally:
+        reset_hermes_home_override(profile_token)
+
+
 def test_auto_detects_and_merges_claude_and_codex_configs(tmp_path: Path) -> None:
     (tmp_path / ".mcp.json").write_text(
         json.dumps(
@@ -896,6 +1053,41 @@ def test_mcp_generations_retain_unchanged_servers_and_drain_in_flight_changes(
     assert second_names["workspace-app-changed"] in without_old
 
 
+def test_invalid_mcp_reload_does_not_lend_last_good_config_to_new_workspace_source(
+    tmp_path: Path,
+) -> None:
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    (project_a / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"docs": {"command": "docs-a"}}}),
+        encoding="utf-8",
+    )
+    (project_b / ".mcp.json").write_text('{"mcpServers": [', encoding="utf-8")
+    workspace_a = workspace(project_a, "app")
+    workspace_b = workspace(project_b, "app")
+    current_router = RouterConfig(workspaces={"app": workspace_a}, routes=())
+    manager = WorkspaceMcpManager(
+        config_provider=lambda: current_router,
+        workspaces=current_router.workspaces,
+        security_filter=lambda entries: entries,
+    )
+
+    old_binding = manager.bind(workspace_a)
+    current_router = RouterConfig(workspaces={"app": workspace_b}, routes=())
+    new_binding = manager.bind(workspace_b)
+
+    assert new_binding.generation.servers == {}
+    assert manager.current_servers(workspace_b) == {}
+    assert "workspace-app-docs" in manager.all_servers(set())
+
+    manager.reset(new_binding)
+    assert "workspace-app-docs" in manager.all_servers(set())
+    manager.reset(old_binding)
+    assert "workspace-app-docs" not in manager.all_servers(set())
+
+
 def test_invalid_workspace_mcp_edit_preserves_last_good_generation(tmp_path: Path) -> None:
     mcp_path = tmp_path / ".mcp.json"
     mcp_path.write_text(
@@ -916,3 +1108,9 @@ def test_invalid_workspace_mcp_edit_preserves_last_good_generation(tmp_path: Pat
 
     assert preserved.logical_names == first.logical_names
     assert preserved.servers == first.servers
+
+    mcp_path.write_bytes(b'{"mcpServers": {"docs": "\xff"}}')
+    preserved_utf8 = manager.refresh_workspace(routed_workspace)
+
+    assert preserved_utf8.logical_names == first.logical_names
+    assert preserved_utf8.servers == first.servers

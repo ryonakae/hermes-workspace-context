@@ -170,5 +170,9 @@ routes:
     preserved = reloader.load()
     assert preserved.workspaces["app"].cwd == second_project.resolve()
 
+    config_path.write_bytes(b"workspaces:\n  app: \xff\n")
+    preserved = reloader.load()
+    assert preserved.workspaces["app"].cwd == second_project.resolve()
+
     write(first_project)
     assert reloader.load().workspaces["app"].cwd == first_project.resolve()

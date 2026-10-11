@@ -67,8 +67,9 @@ hermes-gateway restart
 
 Edits to this plugin's `config.yaml`, workspace route/cwd/skill settings, and supported
 project MCP files are re-read automatically before the next turn. A malformed edit does
-not replace the last valid configuration. A turn already in progress keeps its original
-route, cwd, skills, and MCP connections.
+not replace the last valid configuration for that same resolved source; changing a route to
+a different workspace directory never borrows the previous directory's MCP snapshot. A
+turn already in progress keeps its original route, cwd, skills, and MCP connections.
 
 ## Usage
 
@@ -165,7 +166,7 @@ A route must include `chat_id`, `thread_id`, or both.
 
 The plugin does not change the process cwd or the terminal backend's shared default environment cwd. Routed gateway sessions keep the configured backend type but use the gateway session ID as an isolated terminal environment and file-operations cache key. The plugin binds Hermes' session-scoped cwd `ContextVar` and the terminal/file cwd records for that ID, then restores their previous values after the turn. Overlapping bindings use an ownership stack, while the workspace marker remains task-local, so concurrent routed and unrouted turns do not share state. Hermes may retain the session-keyed environment between matching routed turns for shell continuity and idle cleanup; if the same session ID later becomes unrouted, the plugin removes that environment and file cache before the turn starts.
 
-MCP servers live in Hermes' process-wide MCP registry because Hermes manages MCP connections globally. The plugin namespaces server names as `workspace-<workspace>-<server>` and adds their toolsets only to matching turns. Unmatched turns cannot discover those tools through their enabled toolset catalog. A changed server receives an internal generation suffix; unchanged servers retain their existing name and connection, while a generation with an active turn is drained rather than torn down immediately.
+MCP servers live in Hermes' process-wide MCP registry because Hermes manages MCP connections globally. The plugin namespaces server names as `workspace-<workspace>-<server>` and adds their toolsets only to matching turns. Unmatched turns cannot discover those tools through their enabled toolset catalog. Loader managers, native-name collision state, and last-good MCP snapshots are isolated by resolved Hermes profile and workspace source; profiles never borrow another profile's workspace servers or credentials. A changed server receives an internal generation suffix; unchanged servers retain their existing name and connection, while a generation with an active turn is drained rather than torn down immediately.
 
 Project skills are read-only through this overlay. `skill_manage` continues to target the normal Hermes skill store instead of modifying project files.
 
