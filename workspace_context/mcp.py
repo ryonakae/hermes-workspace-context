@@ -3,22 +3,27 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
+import hashlib
 import os
 import re
 import tomllib
+import threading
 import warnings
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, cast
 
 import yaml
 
-from .config import Workspace
+from .config import RouterConfig, Workspace
 from .diagnostics import component_logger, log_event, runner_fields
 from .runtime import current_workspace
 
 
 _PATCH_MARKER = "_hermes_workspace_context_mcp_patch"
+_CONFIG_PATCH_MARKER = "_hermes_workspace_context_mcp_config_patch"
 _LOGGER = component_logger("mcp")
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _ENV_COLON_PATTERN = re.compile(r"\$?\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -88,6 +93,252 @@ class _McpEntry:
     name: str
     config: dict[str, Any]
     source: Path
+
+
+@dataclass
+class _WorkspaceMcpGeneration:
+    workspace_name: str
+    logical_configs: dict[str, dict[str, Any]]
+    logical_names: dict[str, str]
+    servers: dict[str, dict[str, Any]]
+    generation_id: str
+    active_turns: int = 0
+
+
+@dataclass(frozen=True)
+class WorkspaceMcpBinding:
+    token: Token[_WorkspaceMcpGeneration | None]
+    generation: _WorkspaceMcpGeneration
+
+
+_CURRENT_MCP_GENERATION: ContextVar[_WorkspaceMcpGeneration | None] = ContextVar(
+    "hermes_workspace_context_current_mcp_generation",
+    default=None,
+)
+
+
+def _safe_mode_enabled() -> bool:
+    try:
+        from utils import env_var_enabled
+
+        return bool(env_var_enabled("HERMES_SAFE_MODE"))
+    except Exception:
+        return str(os.environ.get("HERMES_SAFE_MODE", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+
+def _config_fingerprint(config: Mapping[str, Any]) -> str:
+    encoded = json.dumps(config, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class WorkspaceMcpManager:
+    """Track current and draining workspace MCP generations without touching Hermes core."""
+
+    def __init__(
+        self,
+        *,
+        config_provider: Any,
+        workspaces: Mapping[str, Workspace] | None = None,
+        security_filter: Callable[[dict[str, dict[str, Any]]], dict[str, dict[str, Any]]] | None = None,
+    ) -> None:
+        self._config_provider = config_provider
+        self._fallback_workspaces = dict(workspaces or {})
+        self._security_filter = security_filter
+        self._current: dict[str, _WorkspaceMcpGeneration] = {}
+        self._draining: dict[str, list[_WorkspaceMcpGeneration]] = {}
+        self._used_names: dict[tuple[str, str], set[str]] = {}
+        self._last_good_entries: dict[str, dict[str, dict[str, Any]]] = {}
+        self._blocked_names: set[str] = set()
+        self._lock = threading.RLock()
+
+    def update_source(self, *, config_provider: Any, workspaces: Mapping[str, Workspace] | None = None) -> None:
+        with self._lock:
+            if config_provider is not self._config_provider:
+                self._current.clear()
+                self._draining.clear()
+                self._used_names.clear()
+                self._last_good_entries.clear()
+                self._blocked_names.clear()
+            self._config_provider = config_provider
+            if workspaces is not None:
+                self._fallback_workspaces = dict(workspaces)
+
+    def _router_config(self) -> RouterConfig:
+        provider = self._config_provider
+        if hasattr(provider, "load"):
+            config = provider.load()
+        elif callable(provider):
+            config = provider()
+        else:
+            config = RouterConfig(workspaces=self._fallback_workspaces, routes=())
+        if not isinstance(config, RouterConfig):
+            raise McpConfigError("workspace config provider returned an invalid router config")
+        return config
+
+    def _read_entries(self, workspace: Workspace) -> dict[str, dict[str, Any]]:
+        try:
+            entries = load_workspace_mcp_servers(workspace)
+        except McpConfigError as exc:
+            with self._lock:
+                previous = self._last_good_entries.get(workspace.name)
+            if previous is not None:
+                log_event(
+                    _LOGGER,
+                    "workspace_mcp_reload",
+                    result="preserved_last_good",
+                    workspace=workspace.name,
+                    error_type=type(exc).__name__,
+                    server_count=len(previous),
+                    **runner_fields(),
+                )
+                return deepcopy(previous)
+            log_event(
+                _LOGGER,
+                "workspace_mcp_reload",
+                result="skipped_invalid",
+                workspace=workspace.name,
+                error_type=type(exc).__name__,
+                server_count=0,
+                **runner_fields(),
+            )
+            return {}
+        if self._security_filter is not None:
+            try:
+                entries = self._security_filter(entries)
+            except Exception as exc:
+                log_event(
+                    _LOGGER,
+                    "workspace_mcp_reload",
+                    result="skipped_security_filter_error",
+                    workspace=workspace.name,
+                    error_type=type(exc).__name__,
+                    server_count=0,
+                    **runner_fields(),
+                )
+                entries = {}
+        safe_entries = deepcopy(entries)
+        with self._lock:
+            self._last_good_entries[workspace.name] = safe_entries
+        return deepcopy(safe_entries)
+
+    def _allocate_name(self, workspace: Workspace, logical_name: str, config: Mapping[str, Any]) -> str:
+        base = logical_name
+        key = (workspace.name, logical_name)
+        used = self._used_names.setdefault(key, set())
+        if not used:
+            candidate = base
+        else:
+            candidate = f"{base}-g{_config_fingerprint(config)[:12]}"
+            suffix = 2
+            while candidate in used:
+                candidate = f"{base}-g{_config_fingerprint(config)[:12]}-{suffix}"
+                suffix += 1
+        used.add(candidate)
+        return candidate
+
+    def _prune_draining(self, workspace_name: str) -> None:
+        self._draining[workspace_name] = [
+            generation
+            for generation in self._draining.get(workspace_name, ())
+            if generation.active_turns > 0
+        ]
+        if not self._draining[workspace_name]:
+            self._draining.pop(workspace_name, None)
+
+    def refresh_workspace(self, workspace: Workspace) -> _WorkspaceMcpGeneration:
+        entries = self._read_entries(workspace)
+        with self._lock:
+            current = self._current.get(workspace.name)
+            if current is not None and current.logical_configs == entries:
+                self._prune_draining(workspace.name)
+                return current
+            logical_names: dict[str, str] = {}
+            servers: dict[str, dict[str, Any]] = {}
+            for logical_name, config in entries.items():
+                if (
+                    current is not None
+                    and current.logical_configs.get(logical_name) == config
+                    and logical_name in current.logical_names
+                ):
+                    actual_name = current.logical_names[logical_name]
+                else:
+                    actual_name = self._allocate_name(workspace, logical_name, config)
+                logical_names[logical_name] = actual_name
+                servers[actual_name] = deepcopy(config)
+            generation = _WorkspaceMcpGeneration(
+                workspace_name=workspace.name,
+                logical_configs=deepcopy(entries),
+                logical_names=logical_names,
+                servers=servers,
+                generation_id=_config_fingerprint({"workspace": workspace.name, "servers": servers}),
+            )
+            if current is not None and current.active_turns > 0:
+                self._draining.setdefault(workspace.name, []).append(current)
+            self._current[workspace.name] = generation
+            self._prune_draining(workspace.name)
+            return generation
+
+    def refresh_all(self, workspaces: Mapping[str, Workspace]) -> None:
+        for workspace in workspaces.values():
+            self.refresh_workspace(workspace)
+        with self._lock:
+            removed = set(self._current) - set(workspaces)
+            for workspace_name in removed:
+                current = self._current.pop(workspace_name)
+                if current.active_turns > 0:
+                    self._draining.setdefault(workspace_name, []).append(current)
+                self._prune_draining(workspace_name)
+
+    def all_servers(self, native_names: set[str]) -> dict[str, dict[str, Any]]:
+        if _safe_mode_enabled():
+            return {}
+        config = self._router_config()
+        self.refresh_all(config.workspaces)
+        with self._lock:
+            self._blocked_names = set(native_names)
+            generations = list(self._current.values())
+            for draining in self._draining.values():
+                generations.extend(generation for generation in draining if generation.active_turns > 0)
+            servers: dict[str, dict[str, Any]] = {}
+            for generation in generations:
+                for name, server_config in generation.servers.items():
+                    if name not in self._blocked_names:
+                        servers[name] = {"lazy": True, **deepcopy(server_config)}
+            return servers
+
+    def bind(self, workspace: Workspace) -> WorkspaceMcpBinding:
+        generation = self.refresh_workspace(workspace)
+        with self._lock:
+            generation.active_turns += 1
+        return WorkspaceMcpBinding(_CURRENT_MCP_GENERATION.set(generation), generation)
+
+    def reset(self, binding: WorkspaceMcpBinding) -> None:
+        _CURRENT_MCP_GENERATION.reset(binding.token)
+        with self._lock:
+            binding.generation.active_turns = max(0, binding.generation.active_turns - 1)
+            self._prune_draining(binding.generation.workspace_name)
+
+    def current_servers(self, workspace: Workspace) -> dict[str, dict[str, Any]]:
+        if _safe_mode_enabled():
+            return {}
+        generation = _CURRENT_MCP_GENERATION.get()
+        if generation is None or generation.workspace_name != workspace.name:
+            generation = self.refresh_workspace(workspace)
+        with self._lock:
+            return {
+                name: deepcopy(config)
+                for name, config in generation.servers.items()
+                if name not in self._blocked_names
+            }
+
+
+def current_mcp_generation() -> _WorkspaceMcpGeneration | None:
+    return _CURRENT_MCP_GENERATION.get()
 
 
 def _slug(value: str) -> str:
@@ -571,71 +822,107 @@ def reauth_workspace_mcp_server(
     return bool(_core_reauth_oauth_server()(namespaced_name, server_config, flow=flow))
 
 
+def _install_workspace_mcp_loader(
+    *,
+    workspaces: Mapping[str, Workspace],
+    config_provider: Any,
+) -> WorkspaceMcpManager:
+    try:
+        from tools import mcp_tool_config
+    except ImportError:
+        raise McpConfigError("Hermes MCP config loader is unavailable in this runtime") from None
+    original_loader = getattr(mcp_tool_config, "_load_mcp_config", None)
+    security_filter = getattr(mcp_tool_config, "_filter_suspicious_mcp_servers", None)
+    if not callable(original_loader) or not callable(security_filter):
+        raise McpConfigError("Hermes MCP config loader/security API is unavailable in this runtime")
+
+    existing = getattr(mcp_tool_config, _CONFIG_PATCH_MARKER, None)
+    if isinstance(existing, dict) and isinstance(existing.get("manager"), WorkspaceMcpManager):
+        manager = cast(WorkspaceMcpManager, existing["manager"])
+        manager.update_source(config_provider=config_provider, workspaces=workspaces)
+        return manager
+
+    manager = WorkspaceMcpManager(
+        config_provider=config_provider,
+        workspaces=workspaces,
+        security_filter=security_filter,
+    )
+
+    def routed_load_mcp_config() -> dict[str, dict[str, Any]]:
+        native = original_loader()
+        if not isinstance(native, dict) or _safe_mode_enabled():
+            return native if isinstance(native, dict) else {}
+        workspace_servers = manager.all_servers(set(native))
+        merged = dict(native)
+        merged.update({name: config for name, config in workspace_servers.items() if name not in merged})
+        return merged
+
+    setattr(mcp_tool_config, "_load_mcp_config", routed_load_mcp_config)
+    setattr(
+        mcp_tool_config,
+        _CONFIG_PATCH_MARKER,
+        {"manager": manager, "original_loader": original_loader},
+    )
+    return manager
+
+
 def install_mcp_patches(
     *,
     workspaces: Mapping[str, Workspace],
+    config_provider: Any | None = None,
     tools_config: Any | None = None,
     register_mcp_servers: Callable[[dict[str, dict[str, Any]]], list[str]] | None = None,
-) -> None:
-    """Register namespaced project MCP servers and scope their toolsets by task."""
+) -> WorkspaceMcpManager:
+    """Wrap Hermes' loader and expose only the routed workspace's current MCP generation."""
     if tools_config is None:
         from hermes_cli import tools_config as tools_config
     if register_mcp_servers is None:
         from tools.mcp_tool_discovery import register_mcp_servers
     register_servers = cast(Callable[[dict[str, dict[str, Any]]], list[str]], register_mcp_servers)
+    if config_provider is None:
+        config_provider = lambda: RouterConfig(workspaces=dict(workspaces), routes=())
+
+    manager = _install_workspace_mcp_loader(
+        workspaces=workspaces,
+        config_provider=config_provider,
+    )
 
     if getattr(tools_config, _PATCH_MARKER, False):
-        return
+        return manager
     original_get_platform_tools = getattr(tools_config, "_get_platform_tools", None)
     if not callable(original_get_platform_tools):
         raise McpConfigError("Hermes tools_config is missing _get_platform_tools private API")
 
-    server_names_by_workspace: dict[str, tuple[str, ...]] = {}
-    servers_by_workspace: dict[str, dict[str, dict[str, Any]]] = {}
-    all_servers: dict[str, dict[str, Any]] = {}
-    for workspace in workspaces.values():
-        servers = load_workspace_mcp_servers(workspace)
-        overlap = set(all_servers).intersection(servers)
-        if overlap:
-            raise McpConfigError(f"duplicate namespaced MCP server(s): {', '.join(sorted(overlap))}")
-        registration_servers = {
+    def _register_workspace_servers_in_active_profile(workspace: Workspace) -> dict[str, dict[str, Any]]:
+        scoped_servers = {
             name: {"lazy": True, **config}
-            for name, config in servers.items()
+            for name, config in manager.current_servers(workspace).items()
         }
-        all_servers.update(registration_servers)
-        server_names_by_workspace[workspace.name] = tuple(servers)
-        servers_by_workspace[workspace.name] = registration_servers
-
-    register_servers(all_servers)
-
-    def _register_workspace_servers_in_active_profile(workspace_name: str) -> None:
-        """Materialize this routed workspace's MCP entries in the active profile overlay.
-
-        Plugin discovery can run before a multiplexed gateway binds a routed profile, so
-        ``register_mcp_servers`` may initially create a process-global lazy entry. The core's
-        scoped check_fn correctly rejects that entry from a routed profile. Re-running only the
-        current workspace's lazy registrations inside the active scope lets the core register
-        the same cached schemas in that profile without copying unrelated workspaces or
-        weakening availability/trust checks.
-        """
         try:
             from tools.mcp_tool import _mcp_registry_scope
-            if _mcp_registry_scope() is None:
-                return
+            from tools.registry import registry
+            scoped = _mcp_registry_scope()
         except (ImportError, AttributeError):
-            return
-        scoped_servers = servers_by_workspace.get(workspace_name, {})
-        if not scoped_servers:
-            return
-        registered = register_servers(scoped_servers)
-        log_event(
-            _LOGGER,
-            "scoped_mcp_registration",
-            workspace=workspace_name,
-            candidate_count=len(scoped_servers),
-            registered_count=len(registered),
-            **runner_fields(),
-        )
+            scoped = None
+        if scoped is not None and scoped_servers:
+            missing_servers = {
+                name: config
+                for name, config in scoped_servers.items()
+                if not any(
+                    registry.snapshot_registration(tool_name, scope=scoped) is not None
+                    for tool_name in registry.get_tool_names_for_toolset(f"mcp-{name}")
+                )
+            }
+            registered = register_servers(missing_servers) if missing_servers else []
+            log_event(
+                _LOGGER,
+                "scoped_mcp_registration",
+                workspace=workspace.name,
+                candidate_count=len(missing_servers),
+                registered_count=len(registered),
+                **runner_fields(),
+            )
+        return scoped_servers
 
     def routed_get_platform_tools(config: dict, platform: str, **kwargs: Any):
         enabled = set(original_get_platform_tools(config, platform, **kwargs))
@@ -646,10 +933,9 @@ def install_mcp_patches(
         workspace_name = "none"
         if workspace is not None:
             workspace_name = workspace.name
-            _register_workspace_servers_in_active_profile(workspace.name)
-            server_names = server_names_by_workspace.get(workspace.name, ())
-            candidate_count = len(server_names)
-            for server_name in server_names:
+            scoped_servers = _register_workspace_servers_in_active_profile(workspace)
+            candidate_count = len(scoped_servers)
+            for server_name in scoped_servers:
                 toolset_name = f"mcp-{server_name}"
                 if toolset_name not in enabled:
                     enabled.add(toolset_name)
@@ -669,3 +955,4 @@ def install_mcp_patches(
 
     tools_config._get_platform_tools = routed_get_platform_tools
     setattr(tools_config, _PATCH_MARKER, True)
+    return manager

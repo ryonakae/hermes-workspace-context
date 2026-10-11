@@ -29,6 +29,7 @@ class RoutedSessionTokens:
     workspace_token: Token[Workspace | None]
     cwd_token: Any | None
     tool_cwd_token: Any | None
+    mcp_binding: Any | None
     routed: bool
 
 
@@ -89,6 +90,18 @@ def workspace_for_source(config: RouterConfig, source: Any) -> Workspace | None:
         return None
     matches.sort(key=lambda route: (route.thread_id is not None, route.chat_id is not None), reverse=True)
     return config.workspaces[matches[0].workspace]
+
+
+def _resolve_router_config(config: Any) -> RouterConfig:
+    if hasattr(config, "load"):
+        resolved = config.load()
+    elif callable(config):
+        resolved = config()
+    else:
+        resolved = config
+    if not isinstance(resolved, RouterConfig):
+        raise CompatibilityError("workspace router config provider returned an invalid config")
+    return resolved
 
 
 def _default_set_session_cwd(cwd: str) -> Any:
@@ -323,8 +336,9 @@ def _cleanup_plugin_isolation_for_unrouted_session(task_id: str) -> None:
 
 def install_gateway_patches(
     gateway: Any,
-    config: RouterConfig,
+    config: RouterConfig | Callable[[], RouterConfig] | Any,
     *,
+    mcp_manager: Any | None = None,
     set_session_cwd: Callable[[str], Any] | None = None,
     reset_session_cwd: Callable[[Any], None] | None = None,
     bind_tool_cwd: Callable[[str, str], Any] | None = None,
@@ -355,7 +369,8 @@ def install_gateway_patches(
 
     def routed_set(context: Any) -> RoutedSessionTokens:
         source = context.source
-        workspace = workspace_for_source(config, source)
+        router_config = _resolve_router_config(config)
+        workspace = workspace_for_source(router_config, source)
         session_id = str(getattr(context, "session_id", "") or "")
         route = "matched" if workspace is not None else "unmatched"
         log_event(
@@ -373,6 +388,7 @@ def install_gateway_patches(
         hermes_tokens = None
         cwd_token = None
         tool_cwd_token = None
+        mcp_binding = None
         stage = "hermes_session_env"
         try:
             hermes_tokens = original_set(context)
@@ -386,6 +402,8 @@ def install_gateway_patches(
                 **runner_fields(),
             )
             if workspace is not None:
+                if mcp_manager is not None:
+                    mcp_binding = mcp_manager.bind(workspace)
                 stage = "workspace_session_cwd"
                 cwd_token = bind_cwd(str(workspace.cwd))
                 if not session_id:
@@ -420,6 +438,7 @@ def install_gateway_patches(
                 workspace_token=workspace_token,
                 cwd_token=cwd_token,
                 tool_cwd_token=tool_cwd_token,
+                mcp_binding=mcp_binding,
                 routed=workspace is not None,
             )
         except BaseException as exc:
@@ -438,14 +457,18 @@ def install_gateway_patches(
                     reset_tools(tool_cwd_token)
             finally:
                 try:
-                    if cwd_token is not None:
-                        reset_cwd(cwd_token)
+                    if mcp_binding is not None:
+                        mcp_manager.reset(mcp_binding)
                 finally:
                     try:
-                        if hermes_tokens is not None:
-                            original_clear(hermes_tokens)
+                        if cwd_token is not None:
+                            reset_cwd(cwd_token)
                     finally:
-                        _CURRENT_WORKSPACE.reset(workspace_token)
+                        try:
+                            if hermes_tokens is not None:
+                                original_clear(hermes_tokens)
+                        finally:
+                            _CURRENT_WORKSPACE.reset(workspace_token)
             raise
 
     def routed_clear(tokens: Any) -> None:
@@ -468,10 +491,14 @@ def install_gateway_patches(
                     reset_tools(tokens.tool_cwd_token)
             finally:
                 try:
-                    if tokens.cwd_token is not None:
-                        reset_cwd(tokens.cwd_token)
+                    if tokens.mcp_binding is not None:
+                        mcp_manager.reset(tokens.mcp_binding)
                 finally:
-                    _CURRENT_WORKSPACE.reset(tokens.workspace_token)
+                    try:
+                        if tokens.cwd_token is not None:
+                            reset_cwd(tokens.cwd_token)
+                    finally:
+                        _CURRENT_WORKSPACE.reset(tokens.workspace_token)
 
     gateway._set_session_env = routed_set
     gateway._clear_session_env = routed_clear
@@ -485,21 +512,22 @@ def install_gateway_patches(
     )
 
 
-def make_pre_gateway_dispatch(config: RouterConfig):
+def make_pre_gateway_dispatch(config: RouterConfig | Callable[[], RouterConfig] | Any, *, mcp_manager: Any | None = None):
     """Create the public hook that installs private compatibility adapters once."""
 
     def pre_gateway_dispatch(*, event: Any, gateway: Any, **_kwargs: Any) -> None:
         source = getattr(event, "source", None)
+        router_config = _resolve_router_config(config)
         log_event(
             _LOGGER,
             "pre_gateway_dispatch",
             hook="pre_gateway_dispatch",
             platform=_platform_name(source),
             thread_ref=opaque_ref(getattr(source, "thread_id", None)),
-            workspace_count=len(config.workspaces),
+            workspace_count=len(router_config.workspaces),
             **runner_fields(),
         )
-        install_gateway_patches(gateway, config)
+        install_gateway_patches(gateway, config, mcp_manager=mcp_manager)
         return None
 
     return pre_gateway_dispatch

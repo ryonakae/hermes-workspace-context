@@ -57,6 +57,6 @@ Before committing:
 
 ## Runtime changes
 
-A loaded gateway keeps plugin modules and MCP connections in memory. After changing code or `config.yaml`, ask the operator to run `hermes-gateway restart` or use `/restart-gateway`. Do not restart the gateway from an agent sandbox.
+A loaded gateway keeps plugin modules and MCP connections in memory. After changing plugin code, ask the operator to run `hermes-gateway restart` or use `/restart-gateway`. Route/cwd/skill settings and supported project MCP files are hot-reloaded at the next turn; an invalid edit preserves the last valid snapshot and an in-flight turn keeps its existing generation. Do not restart the gateway from an agent sandbox.
 
 `README.md` documents installation, route syntax, security boundaries, and private API compatibility. Update it when public behavior changes.

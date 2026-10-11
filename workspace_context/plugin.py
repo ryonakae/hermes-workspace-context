@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import ConfigError, load_config
+from .config import ConfigError, ConfigReloader, load_config
 from .mcp import (
     McpConfigError,
     install_mcp_patches as _install_mcp_patches,
@@ -126,7 +126,7 @@ def register_plugin(
     *,
     plugin_dir: Path | None = None,
     install_skill_patches: Callable[[], None] = _install_skill_patches,
-    install_mcp_patches: Callable[..., None] = _install_mcp_patches,
+    install_mcp_patches: Callable[..., Any] = _install_mcp_patches,
 ) -> None:
     root = Path(plugin_dir or Path(__file__).resolve().parent.parent)
     ctx.register_cli_command(
@@ -154,10 +154,17 @@ def register_plugin(
             "copy config.yaml.example to config.yaml and edit it"
         )
 
-    config = load_config(config_path)
+    config_provider = ConfigReloader(config_path)
+    config = config_provider.load()
     install_skill_patches()
-    install_mcp_patches(workspaces=config.workspaces)
-    ctx.register_hook("pre_gateway_dispatch", make_pre_gateway_dispatch(config))
+    mcp_manager = install_mcp_patches(
+        workspaces=config.workspaces,
+        config_provider=config_provider,
+    )
+    ctx.register_hook(
+        "pre_gateway_dispatch",
+        make_pre_gateway_dispatch(config_provider, mcp_manager=mcp_manager),
+    )
 
 
 def register(ctx: Any) -> None:

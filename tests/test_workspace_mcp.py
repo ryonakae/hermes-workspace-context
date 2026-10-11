@@ -6,9 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from workspace_context.config import Workspace
+from workspace_context.config import RouterConfig, Workspace
 from workspace_context.mcp import (
     McpConfigError,
+    WorkspaceMcpManager,
     WorkspaceMcpWarning,
     install_mcp_patches,
     load_workspace_mcp_servers,
@@ -129,8 +130,7 @@ def test_mcp_toolsets_are_added_only_inside_matching_workspace(tmp_path: Path) -
         "mcp-workspace-my-app-remote",
     }
     assert unrouted == {"terminal", "skills"}
-    assert len(registered) == 1
-    assert set(registered[0]) == {"workspace-my-app-docs", "workspace-my-app-remote"}
+    assert registered == []
 
 
 def test_mcp_toolset_resolution_logs_workspace_additions_without_secrets(
@@ -197,26 +197,25 @@ def test_workspace_mcp_servers_are_registered_lazy_by_default(tmp_path: Path) ->
     tools_config = SimpleNamespace(_get_platform_tools=lambda *_args, **_kwargs: set())
     registered: list[dict] = []
 
-    install_mcp_patches(
+    manager = install_mcp_patches(
         workspaces={"My App": workspace(tmp_path)},
         tools_config=tools_config,
         register_mcp_servers=lambda servers: registered.append(servers) or [],
     )
 
-    assert registered == [
-        {
-            "workspace-my-app-local": {
-                "command": "local-server",
-                "args": [],
-                "lazy": True,
-            },
-            "workspace-my-app-remote": {
-                "url": "https://example.invalid/mcp",
-                "auth": "oauth",
-                "lazy": True,
-            },
-        }
-    ]
+    assert manager.all_servers(set()) == {
+        "workspace-my-app-local": {
+            "command": "local-server",
+            "args": [],
+            "lazy": True,
+        },
+        "workspace-my-app-remote": {
+            "url": "https://example.invalid/mcp",
+            "auth": "oauth",
+            "lazy": True,
+        },
+    }
+    assert registered == []
 
 
 def test_mcp_patch_is_idempotent(tmp_path: Path) -> None:
@@ -237,7 +236,7 @@ def test_mcp_patch_is_idempotent(tmp_path: Path) -> None:
     )
 
     assert tools_config._get_platform_tools == first
-    assert register_calls == [{}]
+    assert register_calls == []
 
 
 def test_auto_detects_and_merges_claude_and_codex_configs(tmp_path: Path) -> None:
@@ -839,3 +838,81 @@ def test_jsonc_allows_comment_after_trailing_comma(tmp_path: Path) -> None:
     servers = load_workspace_mcp_servers(workspace(tmp_path, "app"), auto_detect=True)
 
     assert servers["workspace-app-local"]["command"] == "server"
+
+
+def test_mcp_generations_retain_unchanged_servers_and_drain_in_flight_changes(
+    tmp_path: Path,
+) -> None:
+    mcp_path = tmp_path / ".mcp.json"
+    mcp_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "stable": {"command": "stable-server"},
+                    "changed": {"command": "changed-v1"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    routed_workspace = workspace(tmp_path, "app")
+    router = RouterConfig(workspaces={"app": routed_workspace}, routes=())
+    manager = WorkspaceMcpManager(
+        config_provider=lambda: router,
+        workspaces=router.workspaces,
+        security_filter=lambda entries: entries,
+    )
+
+    first = manager.bind(routed_workspace)
+    first_names = dict(first.generation.logical_names)
+
+    mcp_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "stable": {"command": "stable-server"},
+                    "changed": {"command": "changed-v2"},
+                    "added": {"command": "added-server"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    second = manager.bind(routed_workspace)
+    second_names = dict(second.generation.logical_names)
+    assert second_names["workspace-app-stable"] == first_names["workspace-app-stable"]
+    assert second_names["workspace-app-changed"] != first_names["workspace-app-changed"]
+    assert "workspace-app-added" in second_names
+
+    with_old = manager.all_servers(set())
+    assert first_names["workspace-app-changed"] in with_old
+    assert second_names["workspace-app-changed"] in with_old
+
+    manager.reset(second)
+    assert first_names["workspace-app-changed"] in manager.all_servers(set())
+    manager.reset(first)
+    without_old = manager.all_servers(set())
+    assert first_names["workspace-app-changed"] not in without_old
+    assert second_names["workspace-app-changed"] in without_old
+
+
+def test_invalid_workspace_mcp_edit_preserves_last_good_generation(tmp_path: Path) -> None:
+    mcp_path = tmp_path / ".mcp.json"
+    mcp_path.write_text(
+        json.dumps({"mcpServers": {"docs": {"command": "docs-v1"}}}),
+        encoding="utf-8",
+    )
+    routed_workspace = workspace(tmp_path, "app")
+    router = RouterConfig(workspaces={"app": routed_workspace}, routes=())
+    manager = WorkspaceMcpManager(
+        config_provider=lambda: router,
+        workspaces=router.workspaces,
+        security_filter=lambda entries: entries,
+    )
+    first = manager.refresh_workspace(routed_workspace)
+    mcp_path.write_text('{"mcpServers": [', encoding="utf-8")
+
+    preserved = manager.refresh_workspace(routed_workspace)
+
+    assert preserved.logical_names == first.logical_names
+    assert preserved.servers == first.servers

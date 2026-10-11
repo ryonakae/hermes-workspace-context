@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from workspace_context.config import ConfigError, load_config
+from workspace_context.config import ConfigError, ConfigReloader, load_config
 
 
 def test_load_config_resolves_workspace_paths_and_routes(tmp_path: Path) -> None:
@@ -136,3 +136,39 @@ routes:
 
     with pytest.raises(ConfigError, match="chat_id or thread_id"):
         load_config(config_path)
+
+
+def test_config_reloader_hot_reloads_and_preserves_last_good_on_invalid_edit(tmp_path: Path) -> None:
+    first_project = tmp_path / "first"
+    second_project = tmp_path / "second"
+    first_project.mkdir()
+    second_project.mkdir()
+    config_path = tmp_path / "config.yaml"
+
+    def write(project: Path) -> None:
+        config_path.write_text(
+            f"""
+workspaces:
+  app:
+    cwd: {project}
+routes:
+  - platform: slack
+    chat_id: C123EXAMPLE
+    workspace: app
+""",
+            encoding="utf-8",
+        )
+
+    write(first_project)
+    reloader = ConfigReloader(config_path)
+    assert reloader.load().workspaces["app"].cwd == first_project.resolve()
+
+    write(second_project)
+    assert reloader.load().workspaces["app"].cwd == second_project.resolve()
+
+    config_path.write_text("workspaces: [invalid", encoding="utf-8")
+    preserved = reloader.load()
+    assert preserved.workspaces["app"].cwd == second_project.resolve()
+
+    write(first_project)
+    assert reloader.load().workspaces["app"].cwd == first_project.resolve()

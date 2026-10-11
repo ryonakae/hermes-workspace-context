@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from workspace_context.config import Route, RouterConfig, Workspace
+from workspace_context.config import ConfigReloader, Route, RouterConfig, Workspace
 from workspace_context.runtime import (
     current_workspace,
     install_gateway_patches,
@@ -163,6 +163,60 @@ def test_workspace_context_is_isolated_between_concurrent_tasks(tmp_path: Path) 
         return await asyncio.gather(observe("C_TARGET"), observe("C_OTHER"))
 
     assert asyncio.run(run()) == ["app", None]
+
+
+def test_gateway_route_and_cwd_hot_reload_between_turns_but_not_in_flight(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    config_path = tmp_path / "config.yaml"
+
+    def write(project: Path, workspace_name: str = "app") -> None:
+        config_path.write_text(
+            f"""
+workspaces:
+  {workspace_name}:
+    cwd: {project}
+routes:
+  - platform: slack
+    chat_id: C_TARGET
+    workspace: {workspace_name}
+""",
+            encoding="utf-8",
+        )
+
+    write(first)
+    reloader = ConfigReloader(config_path)
+    gateway = FakeGateway()
+    cwd_values: list[str] = []
+    install_gateway_patches(
+        gateway,
+        reloader,
+        set_session_cwd=cwd_values.append,
+        reset_session_cwd=lambda _token: None,
+        bind_tool_cwd=lambda _task_id, cwd: cwd,
+        reset_tool_cwd=lambda _token: None,
+    )
+
+    in_flight = gateway._set_session_env(context("C_TARGET", "first"))
+    assert current_workspace() is not None
+    assert current_workspace().cwd == first.resolve()
+
+    write(second)
+    assert current_workspace().cwd == first.resolve()
+    gateway._clear_session_env(in_flight)
+
+    next_turn = gateway._set_session_env(context("C_TARGET", "second"))
+    try:
+        assert current_workspace() is not None
+        assert current_workspace().cwd == second.resolve()
+    finally:
+        gateway._clear_session_env(next_turn)
+
+    assert cwd_values == [str(first.resolve()), str(second.resolve())]
 
 
 def test_routed_context_restores_outer_hermes_cwd(tmp_path: Path) -> None:

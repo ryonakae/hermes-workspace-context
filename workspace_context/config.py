@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import threading
 from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
+
+from .diagnostics import component_logger, log_event, runner_fields
+
+
+_LOGGER = component_logger("config")
 
 
 class ConfigError(ValueError):
@@ -34,6 +40,63 @@ class Route:
 class RouterConfig:
     workspaces: Mapping[str, Workspace]
     routes: tuple[Route, ...]
+
+
+def _config_file_signature(path: Path) -> tuple[Any, ...]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return ("missing",)
+    return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
+@dataclass
+class ConfigReloader:
+    """Keep the last valid router configuration while accepting atomic file edits."""
+
+    path: Path
+    _config: RouterConfig | None = field(default=None, init=False, repr=False)
+    _signature: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
+    _invalid_signature: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+
+    def load(self) -> RouterConfig:
+        with self._lock:
+            signature = _config_file_signature(self.path)
+            if self._config is not None and signature == self._signature:
+                return self._config
+            if self._config is not None and signature == self._invalid_signature:
+                return self._config
+            try:
+                candidate = load_config(self.path)
+            except (ConfigError, OSError) as exc:
+                if self._config is None:
+                    raise
+                self._invalid_signature = signature
+                log_event(
+                    _LOGGER,
+                    "config_reload",
+                    result="preserved_last_good",
+                    error_type=type(exc).__name__,
+                    workspace_count=len(self._config.workspaces),
+                    route_count=len(self._config.routes),
+                    **runner_fields(),
+                )
+                return self._config
+            previous = self._config
+            self._config = candidate
+            self._signature = signature
+            self._invalid_signature = None
+            if previous is not None:
+                log_event(
+                    _LOGGER,
+                    "config_reload",
+                    result="reloaded",
+                    workspace_count=len(candidate.workspaces),
+                    route_count=len(candidate.routes),
+                    **runner_fields(),
+                )
+            return candidate
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:

@@ -8,6 +8,7 @@ Apply a project workspace context to selected Hermes gateway conversations witho
 - **Workspace context:** Applies the workspace's cwd, context files, skills, and MCP tools to each matching conversation.
 - **Project-first skills:** Adds configured project skill directories to the standard skills index. A project skill wins when its name matches a global skill.
 - **Workspace MCP:** Auto-detects Claude Code, Codex, OpenCode, and Hermes project MCP configs, merges compatible entries, and exposes their namespaced tools only while that workspace route is active.
+- **Hot reload:** Route, cwd, skill-root, and project MCP edits are picked up at the next turn. In-flight turns keep their original workspace and MCP generation; invalid edits keep the last valid snapshot.
 - **Default profile preserved:** Unmatched conversations keep their existing profile, memory, plugins, skills, cwd, and toolsets.
 
 ## Contents
@@ -58,11 +59,16 @@ routes:
     workspace: web-app
 ```
 
-Restart the Hermes gateway after changing plugin code or configuration:
+Restart the Hermes gateway after changing plugin code:
 
 ```bash
 hermes-gateway restart
 ```
+
+Edits to this plugin's `config.yaml`, workspace route/cwd/skill settings, and supported
+project MCP files are re-read automatically before the next turn. A malformed edit does
+not replace the last valid configuration. A turn already in progress keeps its original
+route, cwd, skills, and MCP connections.
 
 ## Usage
 
@@ -140,7 +146,7 @@ Missing skill directories and MCP files are allowed. A missing workspace `cwd` i
 
 Remote OAuth defaults are preserved during conversion: Claude Code, Codex, and OpenCode remote entries become Hermes `auth: oauth` unless they explicitly disable OAuth or provide an `Authorization` header. OpenCode timeouts are converted from milliseconds to Hermes seconds. A Codex server using `auth = "chatgpt"` is skipped because Hermes cannot safely reproduce that credential source.
 
-Workspace MCP servers are registered with Hermes `lazy: true` by default. When Hermes has a matching schema-cache entry, tools remain discoverable without connecting to every server during gateway startup; the first tool call establishes the live connection. A missing or stale cache still uses Hermes' normal eager connection once to refresh the schema. An explicit `lazy: false` in a workspace Hermes MCP entry is preserved.
+Workspace MCP servers are registered with Hermes `lazy: true` by default. When Hermes has a matching schema-cache entry, tools remain discoverable without connecting to every server during gateway startup; the first tool call establishes the live connection. A missing or stale cache still uses Hermes' normal eager connection once to refresh the schema. An explicit `lazy: false` in a workspace Hermes MCP entry is preserved. When a connection definition changes, the plugin gives the new definition a new internal generation, retains the old generation only while an earlier routed turn is using it, and lets Hermes' normal reconciliation remove it after that turn drains.
 
 ### `routes`
 
@@ -159,7 +165,7 @@ A route must include `chat_id`, `thread_id`, or both.
 
 The plugin does not change the process cwd or the terminal backend's shared default environment cwd. Routed gateway sessions keep the configured backend type but use the gateway session ID as an isolated terminal environment and file-operations cache key. The plugin binds Hermes' session-scoped cwd `ContextVar` and the terminal/file cwd records for that ID, then restores their previous values after the turn. Overlapping bindings use an ownership stack, while the workspace marker remains task-local, so concurrent routed and unrouted turns do not share state. Hermes may retain the session-keyed environment between matching routed turns for shell continuity and idle cleanup; if the same session ID later becomes unrouted, the plugin removes that environment and file cache before the turn starts.
 
-MCP servers live in Hermes' process-wide MCP registry because Hermes manages MCP connections globally. The plugin namespaces server names as `workspace-<workspace>-<server>` and adds their toolsets only to matching turns. Unmatched turns cannot discover those tools through their enabled toolset catalog.
+MCP servers live in Hermes' process-wide MCP registry because Hermes manages MCP connections globally. The plugin namespaces server names as `workspace-<workspace>-<server>` and adds their toolsets only to matching turns. Unmatched turns cannot discover those tools through their enabled toolset catalog. A changed server receives an internal generation suffix; unchanged servers retain their existing name and connection, while a generation with an active turn is drained rather than torn down immediately.
 
 Project skills are read-only through this overlay. `skill_manage` continues to target the normal Hermes skill store instead of modifying project files.
 
@@ -173,7 +179,8 @@ This plugin intentionally uses Hermes private APIs because the public plugin API
 - skill discovery helpers in `agent.skill_utils`, `agent.prompt_builder`, and `tools.skills_tool`;
 - current Hermes skill snapshots use `agent.prompt_builder._load_skills_snapshot()` and `_skills_prompt_snapshot_path()`; the plugin redirects routed project snapshots into Hermes scratch, while older cores with `_write_skills_snapshot()` are supported when present;
 - `hermes_cli.tools_config._get_platform_tools()`;
-- `tools.mcp_tool_discovery.register_mcp_servers()`;
+- `tools.mcp_tool_config._load_mcp_config()` and `_filter_suspicious_mcp_servers()`;
+- `tools.mcp_tool_discovery.register_mcp_servers()` and `reconcile_mcp_servers_with_config()`;
 - `hermes_cli.mcp_config._reauth_oauth_server()` for the CLI-only OAuth adapter. This private call is isolated in `workspace_context/mcp.py`, receives the namespaced server key, and is validated before use.
 
 The plugin fails closed when required gateway or toolset APIs disappear. Run the test suite after upgrading Hermes.

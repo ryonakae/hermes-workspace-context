@@ -64,7 +64,11 @@ def test_routed_workspace_mcp_is_visible_in_real_core_registry_scope(tmp_path: P
         from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
         from model_tools import get_tool_definitions, handle_function_call
         from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
-        from tools.mcp_tool_discovery import register_mcp_servers
+        from tools.mcp_tool_discovery import (
+            discover_mcp_tools,
+            reconcile_mcp_servers_with_config,
+            register_mcp_servers,
+        )
         from tools.registry import registry
         from workspace_context.config import Workspace
         from workspace_context.mcp import install_mcp_patches, load_workspace_mcp_servers
@@ -92,7 +96,7 @@ def test_routed_workspace_mcp_is_visible_in_real_core_registry_scope(tmp_path: P
         )
         write_cache_entry(
             server_name,
-            config_fingerprint(server_config),
+            config_fingerprint({"lazy": True, **server_config}),
             tools=[
                 {
                     "name": "find_organizations",
@@ -103,7 +107,7 @@ def test_routed_workspace_mcp_is_visible_in_real_core_registry_scope(tmp_path: P
         )
         write_cache_entry(
             other_server_name,
-            config_fingerprint(other_server_config),
+            config_fingerprint({"lazy": True, **other_server_config}),
             tools=[
                 {
                     "name": "list_issues",
@@ -117,7 +121,7 @@ def test_routed_workspace_mcp_is_visible_in_real_core_registry_scope(tmp_path: P
         patched_tools_config = SimpleNamespace(
             _get_platform_tools=lambda _config, _platform, **_kwargs: {"terminal", "skills"}
         )
-        install_mcp_patches(
+        mcp_manager = install_mcp_patches(
             workspaces={
                 workspace.name: workspace,
                 other_workspace.name: other_workspace,
@@ -125,6 +129,7 @@ def test_routed_workspace_mcp_is_visible_in_real_core_registry_scope(tmp_path: P
             tools_config=patched_tools_config,
             register_mcp_servers=register_mcp_servers,
         )
+        discover_mcp_tools()
         tool_name = next(iter(registry.get_tool_names_for_toolset(f"mcp-{server_name}")))
         other_tool_name = next(
             iter(registry.get_tool_names_for_toolset(f"mcp-{other_server_name}"))
@@ -237,6 +242,65 @@ def test_routed_workspace_mcp_is_visible_in_real_core_registry_scope(tmp_path: P
 
         parallel_results = asyncio.run(observe_parallel())
 
+        # A changed workspace MCP connection becomes a new generation. The real core reconcile
+        # removes the old name and discovers the new cached entry without a core edit.
+        project.joinpath(".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "sentry": {
+                            "type": "http",
+                            "url": "https://example.invalid/mcp-v2",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        changed_generation = mcp_manager.refresh_workspace(workspace)
+        changed_server_name = next(iter(changed_generation.servers))
+        changed_server_config = changed_generation.servers[changed_server_name]
+        write_cache_entry(
+            changed_server_name,
+            config_fingerprint({"lazy": True, **changed_server_config}),
+            tools=[
+                {
+                    "name": "find_organizations",
+                    "description": "Find Sentry organizations after reload.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ],
+        )
+        reload_secret_token = set_secret_scope(
+            {}, profile_home=__import__("os").environ["HERMES_HOME"]
+        )
+        try:
+            reload_result = reconcile_mcp_servers_with_config()
+            reload_token = _CURRENT_WORKSPACE.set(workspace)
+            try:
+                reloaded_enabled = sorted(
+                    patched_tools_config._get_platform_tools(
+                        {"platform_toolsets": {"slack": ["hermes-slack"]}},
+                        "slack",
+                    )
+                )
+                reloaded_defs = get_tool_definitions(
+                    enabled_toolsets=reloaded_enabled,
+                    quiet_mode=False,
+                    skip_tool_search_assembly=True,
+                )
+                expected_changed_tool = (
+                    f"mcp__{changed_server_name.replace('-', '_')}__find_organizations"
+                )
+                reloaded_visible = any(
+                    item["function"]["name"] == expected_changed_tool
+                    for item in reloaded_defs
+                )
+            finally:
+                _CURRENT_WORKSPACE.reset(reload_token)
+        finally:
+            reset_secret_scope(reload_secret_token)
+
         # A separate profile scope sees neither the routed overlay nor workspace MCP toolsets.
         other_profile = __import__("os").environ["OTHER_PROFILE_HOME"]
         profile_home_token = set_hermes_home_override(other_profile)
@@ -280,6 +344,9 @@ def test_routed_workspace_mcp_is_visible_in_real_core_registry_scope(tmp_path: P
             "profile_visible": tool_name in profile_names or other_tool_name in profile_names,
             "parallel_results": parallel_results,
             "enabled_workspace_toolset": f"mcp-{server_name}" in enabled,
+            "reload_result": reload_result,
+            "changed_server_name": changed_server_name,
+            "reloaded_visible": reloaded_visible,
         }))
         assert global_registered
         assert routed_registered, {
@@ -307,6 +374,9 @@ def test_routed_workspace_mcp_is_visible_in_real_core_registry_scope(tmp_path: P
         assert tool_name not in profile_names
         assert other_tool_name not in profile_names
         assert parallel_results == [True, True]
+        assert server_name in reload_result["removed"]
+        assert changed_server_name in reload_result["added"]
+        assert reloaded_visible
         """
     )
     env = os.environ.copy()
