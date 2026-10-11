@@ -182,9 +182,10 @@ This plugin intentionally uses Hermes private APIs because the public plugin API
 - `hermes_cli.tools_config._get_platform_tools()`;
 - `tools.mcp_tool_config._load_mcp_config()` and `_filter_suspicious_mcp_servers()`;
 - `tools.mcp_tool_discovery.register_mcp_servers()` and `reconcile_mcp_servers_with_config()`;
+- `tools.mcp_tool._mcp_registry_scope()` and `tools.registry.registry` methods `snapshot_registration()` and `get_tool_names_for_toolset()` for scope-aware registration before turn tool definitions are assembled;
 - `hermes_cli.mcp_config._reauth_oauth_server()` for the CLI-only OAuth adapter. This private call is isolated in `workspace_context/mcp.py`, receives the namespaced server key, and is validated before use.
 
-The plugin fails closed when required gateway or toolset APIs disappear. Run the test suite after upgrading Hermes.
+The plugin fails closed when required gateway or toolset APIs disappear. If the MCP registry cannot be imported, synchronous workspace MCP registration is skipped; toolset names alone do not guarantee that tools are available. Cores without the registry APIs above are not verified. Run the test suite after upgrading Hermes.
 
 ## Development
 
